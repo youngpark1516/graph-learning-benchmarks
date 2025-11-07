@@ -1,0 +1,12 @@
+[submodule "submodules/graph-token"]
+	path = submodules/graph-token
+	url = https://github.com/alip67/graph-token.git
+[submodule "submodules/autograph"]
+	path = submodules/autograph
+	url = https://github.com/BorgwardtLab/AutoGraph.git
+[submodule "submodules/graphgps"]
+	path = submodules/graphgps
+	url = https://github.com/rampasek/GraphGPS.git
+[submodule "submodules/reassesed_LRGB"]
+	path = submodules/reassesed_LRGB
+	url = https://github.com/toenshoff/LRGB.git
