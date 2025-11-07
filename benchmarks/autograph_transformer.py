@@ -350,7 +350,7 @@ def main():
         score_to_compare = valid_loss
         if score_to_compare < best_valid_loss:
             best_valid_loss = score_to_compare
-            torch.save(model.state_dict(), "best_model.pt")
+            torch.save(model.state_dict(), "autograph_best_model.pt")
 
         print(f"Epoch {epoch+1}/{n_epochs}")
         print(f"Train loss: {train_loss:.4f} | Train acc: {train_acc:.4f}")
