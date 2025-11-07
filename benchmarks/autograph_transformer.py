@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# coding=utf-8
-
 """Transformer model for processing graph task data."""
 
 import json
@@ -25,7 +22,7 @@ class GraphDataset(Dataset):
         algorithm: str,
         split: str,
         max_seq_length: int = 512,
-        max_text_length: int = 128  # Maximum length for text tokens
+        max_text_length: int = 128
     ):
         self.data_dir = Path(data_dir)
         self.task = task
@@ -34,10 +31,8 @@ class GraphDataset(Dataset):
         self.max_seq_length = max_seq_length
         self.max_text_length = max_text_length
         
-        # Load all samples
         self.samples = self._load_samples()
         
-        # Build vocabulary from all tokens
         self.token2idx = {"[PAD]": 0, "[CLS]": 1, "[SEP]": 2}
         self._build_vocabulary()
 
@@ -55,14 +50,12 @@ class GraphDataset(Dataset):
 
     def _build_vocabulary(self):
         """Build token vocabulary from all samples."""
-        # Graph tokens -> strings
         for sample in self.samples:
             tokens = [str(t) for t in sample["tokens"]]
             for token in tokens:
                 if token not in self.token2idx:
                     self.token2idx[token] = len(self.token2idx)
 
-        # Text tokens (includes <q>, <p>, and the answer token after <p>)
         for sample in self.samples:
             text_tokens = sample["text"].strip().split()
             for tok in text_tokens:
@@ -86,40 +79,32 @@ class GraphDataset(Dataset):
         if not (0 <= i_q < i_p < len(text_tokens) - 1):
             raise ValueError("Require <q> ... <p> ANSWER, with at least one token after <p>.")
 
-        # Keep "<q> questiontype <p>"
         question_span = ["<q>"] + text_tokens[i_q+1:i_p] + ["<p>"]
-        answer_tok = text_tokens[i_p + 1]  # single-token answer (e.g., "no")
+        answer_tok = text_tokens[i_p + 1]
         return question_span, answer_tok
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         sample = self.samples[idx]
 
-        # Graph tokens (as strings)
         graph_tokens = [str(t) for t in sample["tokens"]]
 
-        # Full text tokens (used to slice question/answer)
         text_tokens = sample["text"].strip().split()
 
-        # Build the INPUT as: graph_tokens + "<q> questiontype <p>"
         q_span, answer_tok = self._extract_q_p(text_tokens)
         combined = graph_tokens + q_span
 
-        # Reserve 1 slot for [CLS]; we do NOT add [SEP] so last non-pad is "<p>"
         if len(combined) > self.max_seq_length - 1:
             combined = combined[: self.max_seq_length - 1]
 
         token_ids = [self.token2idx["[CLS]"]]
         token_ids.extend([self.token2idx.get(t, self.token2idx["[PAD]"]) for t in combined])
 
-        # Pad to max_seq_length
         padding_length = self.max_seq_length - len(token_ids)
         if padding_length > 0:
             token_ids.extend([self.token2idx["[PAD]"]] * padding_length)
 
-        # Attention mask: 1 for non-pad
         attention_mask = [1 if t != self.token2idx["[PAD]"] else 0 for t in token_ids]
 
-        # Label: the single token after <p>
         label_id = self.token2idx.get(answer_tok, self.token2idx["[PAD]"])
 
         return {
@@ -201,14 +186,12 @@ class GraphTransformer(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        # input_ids: batch_size x seq_length
-        # attention_mask: batch_size x seq_length (1 for tokens, 0 for padding)
+        # input_ids: BS
         
         seq_length = input_ids.size(1)
         
-        # Create embeddings
         x = self.token_embedding(input_ids)  # batch_size x seq_length x d_model
-        x = x + self.position_embedding[:seq_length].unsqueeze(0)  # Add positional encoding
+        x = x + self.position_embedding[:seq_length].unsqueeze(0)
         x = self.dropout(x)
         
         # Convert attention_mask for transformer (1->False, 0->True for key_padding_mask)
@@ -218,13 +201,12 @@ class GraphTransformer(nn.Module):
             mask = None
         
         # Apply transformer layers
-        x = x.transpose(0, 1)  # seq_length x batch_size x d_model
+        x = x.transpose(0, 1)  # SBD
         for layer in self.encoder_layers:
             x = layer(x, mask=mask)
-        x = x.transpose(0, 1)  # batch_size x seq_length x d_model
+        x = x.transpose(0, 1)  # BSD
         
-        # Project to vocabulary
-        logits = self.output_projection(x)  # batch_size x seq_length x vocab_size
+        logits = self.output_projection(x)  # BSV
         
         return logits
 
@@ -242,11 +224,8 @@ def train_epoch(model, dataloader, optimizer, device) -> tuple[float, float]:
         optimizer.zero_grad()
         logits = model(input_ids, attention_mask)  # (B, S, V)
 
-        # position of the last non-pad token = where we placed "<p>"
         lengths = attention_mask.long().sum(dim=1)  # (B,)
-        p_pos = lengths - 1  # index of "<p>" in each sequence
 
-        # Gather logits at p_pos for each item
         bsz = input_ids.size(0)
         logits_at_p = logits[torch.arange(bsz, device=device), p_pos, :]  # (B, V)
 
@@ -264,7 +243,7 @@ def train_epoch(model, dataloader, optimizer, device) -> tuple[float, float]:
     return avg_loss, acc
 
 
-def eval_epoch(model, dataloader, device) -> tuple[float, float]:  # NEW: validation matches training
+def eval_epoch(model, dataloader, device) -> tuple[float, float]:
     model.eval()
     total_loss = 0.0
     total_correct = 0
@@ -295,26 +274,20 @@ def eval_epoch(model, dataloader, device) -> tuple[float, float]:  # NEW: valida
 
 
 def main():
-    # Example usage
     data_dir = Path("/data/young/capstone/graph-learning-benchmarks/submodules/graph-token")
     task = "cycle_check"
     algorithm = "er"
     
-    # Create datasets
     train_dataset = GraphDataset(data_dir, task, algorithm, "train")
     valid_dataset = GraphDataset(data_dir, task, algorithm, "valid")
 
-    # --- NEW: share vocab/mappings to avoid OOV index errors on valid ---
     valid_dataset.token2idx = train_dataset.token2idx
     valid_dataset.idx2token = train_dataset.idx2token
     valid_dataset.vocab_size = train_dataset.vocab_size
-    # --------------------------------------------------------------------
 
-    # Create dataloaders
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     valid_loader = DataLoader(valid_dataset, batch_size=32)
     
-    # Initialize model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = GraphTransformer(
         vocab_size=train_dataset.vocab_size,
@@ -328,25 +301,19 @@ def main():
     print(f"Number of training samples: {len(train_dataset)}")
     print(f"Number of validation samples: {len(valid_dataset)}")
     
-    # Training setup
     optimizer = Adam(model.parameters(), lr=1e-4)
     scheduler = CosineAnnealingLR(optimizer, T_max=10)
     
-    # Training loop
     n_epochs = 10
     best_valid_loss = float('inf')
     
     for epoch in range(n_epochs):
-        # Train
         train_loss, train_acc = train_epoch(model, train_loader, optimizer, device)
 
-        # Validate (same objective: predict token after <p>)
         valid_loss, valid_acc = eval_epoch(model, valid_loader, device)
 
-        # Update learning rate
         scheduler.step()
 
-        # Save best model
         score_to_compare = valid_loss
         if score_to_compare < best_valid_loss:
             best_valid_loss = score_to_compare
