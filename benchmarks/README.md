@@ -1,6 +1,46 @@
 # Benchmarks Directory
 
-This directory contains scripts and resources for running and evaluating graph learning models and tasks. Below is a description of each file:
+This directory contains scripts and resources for running and evaluating graph learning models and tasks. Below is a description of each file and related submodules.
+
+## Related Submodules
+
+The project includes several key submodules that work together with these benchmarks:
+
+### autograph/
+- A framework for graph-based machine learning
+- Includes data modules, evaluation tools, and model implementations
+- Contains configuration files for training and testing
+
+### graph-token/
+- Tools for graph generation and task creation
+- Supports various graph types (BA, Complete, ER, Path, SBM, SFN, Star)
+- Implements different graph tasks:
+  - Connected nodes
+  - Cycle checking
+  - Edge counting/existence
+  - Node counting/degree
+  - Shortest path
+
+### graphgps/
+- Graph Processing System implementation
+- Includes various model architectures:
+  - GatedGCN
+  - GINE
+  - GPS
+  - Graphormer
+  - SAN
+- Provides comprehensive testing and evaluation tools
+
+### reassesed_LRGB/
+- Reassessed Long-Range Graph Benchmark
+- Contains fine-tuned configurations
+- Shares common architecture with graphgps
+
+### SMP/
+- Includes configurations for cycles and multi-task learning
+- Supports ZINC dataset experiments
+- Contains model implementations and utilities
+- Dataset generation tools included
 
 ## Files
 
