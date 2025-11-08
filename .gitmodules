@@ -10,3 +10,6 @@
 [submodule "submodules/reassesed_LRGB"]
 	path = submodules/reassesed_LRGB
 	url = https://github.com/toenshoff/LRGB.git
+[submodule "submodules/SMP"]
+	path = submodules/SMP
+	url = https://github.com/cvignac/SMP.git
