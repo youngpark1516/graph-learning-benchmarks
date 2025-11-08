@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-# coding=utf-8
-
-r"""Generate task-specific tokenized graph samples using AutoGraph's tokenizer."""
-
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -18,13 +13,9 @@ import numpy as np
 import torch
 from torch_geometric.data import Data
 
-# Add AutoGraph to path
 sys.path.append(str(Path(__file__).parent.parent / 'submodules' / 'autograph'))
 from autograph.datamodules.data.tokenizer import Graph2TrailTokenizer
 
-# Ensure graph-token utilities are importable. The folder name contains a hyphen
-# ("graph-token") so it cannot be imported as a package; add its directory
-# to sys.path so `import graph_task` works.
 _GRAPH_TOKEN_DIR = Path(__file__).parent.parent / 'submodules' / 'graph-token'
 sys.path.insert(0, str(_GRAPH_TOKEN_DIR))
 
@@ -110,30 +101,23 @@ def convert_nx_to_pyg(g: nx.Graph) -> Data:
     """Convert NetworkX graph to PyG Data object."""
     num_nodes = g.number_of_nodes()
     
-    # Ensure nodes are numbered consecutively from 0 to n-1
     g = nx.convert_node_labels_to_integers(g, first_label=0)
     
-    # Handle empty graphs
     if g.number_of_edges() == 0:
         edge_index = torch.zeros((2, 0), dtype=torch.long)
     else:
-        # Sort edges for consistency
         edges = sorted(g.edges())
-        # Create edge index tensor ensuring proper node indexing
         edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
         
-        # For undirected graphs, add reverse edges
         if not g.is_directed():
             edge_index_rev = edge_index.flip(0)
             edge_index = torch.cat([edge_index, edge_index_rev], dim=1)
     
-    # Create and return PyG Data object
     data = Data(
         edge_index=edge_index,
         num_nodes=num_nodes
     )
     
-    # Ensure edge_index is coalesced
     if data.edge_index.numel() > 0:
         data = data.coalesce()
     
@@ -141,22 +125,19 @@ def convert_nx_to_pyg(g: nx.Graph) -> Data:
 
 def tokenize_graph(g: nx.Graph, tokenizer: Graph2TrailTokenizer) -> torch.Tensor:
     """Convert a graph to tokens using AutoGraph's tokenizer."""
-    # Convert to PyG format
     data = convert_nx_to_pyg(g)
-    # Tokenize
     return tokenizer.tokenize(data)
 
 class AutoGraphTokenizer:
     """Wrapper for Graph2TrailTokenizer to maintain compatibility with task classes."""
     def __init__(self, rng: np.random.RandomState):
-        # Convert numpy RandomState to integer seed for consistency
         seed = rng.randint(0, 2**32 - 1)
         self.tokenizer = Graph2TrailTokenizer(
-            max_length=-1,  # No maximum length
-            labeled_graph=False,  # Our graphs are unlabeled
-            undirected=True,  # Assuming undirected graphs
-            append_eos=True,  # Add end of sequence token
-            rng=seed  # Pass integer seed instead of RandomState
+            max_length=-1,
+            labeled_graph=False,
+            undirected=True,
+            append_eos=True,
+            rng=seed
         )
         self.max_nodes = 0
 
@@ -185,7 +166,6 @@ def main(argv: Sequence[str]) -> None:
         else [_ALGORITHM.value]
     )
 
-    # Load graphs per algorithm & split
     graphs: list[nx.Graph] = []
     algs_for_graph: list[str] = []
     for alg in algorithms:
@@ -199,21 +179,17 @@ def main(argv: Sequence[str]) -> None:
             f"No graphs found in {_GRAPHS_DIR.value} for algorithms={algorithms} split={_SPLIT.value}"
         )
 
-    # Initialize AutoGraph tokenizer
     auto_tokenizer = AutoGraphTokenizer(rng)
     auto_tokenizer.update_max_nodes(graphs)
     logging.info("Initialized AutoGraph tokenizer with max_nodes=%d", auto_tokenizer.max_nodes)
 
-    # Instantiate task
     TaskCls = TASK_CLASS[_TASK.value]
     task = TaskCls()
 
-    # Special case: node_classification requires SBM regeneration
     if _TASK.value == "node_classification":
         graphs = _regenerate_sbm_graphs_like(graphs, rng)
 
-    # Create a separate directory structure for AutoGraph tokenizations
-    base_dir = Path(_TASK_DIR.value).parent / "tasks_autograph"  # Creates a parallel directory to 'tasks'
+    base_dir = Path(_TASK_DIR.value).parent / "tasks_autograph"
     out_root = base_dir / _TASK.value
     _ensure_dir(out_root)
 
@@ -223,29 +199,23 @@ def main(argv: Sequence[str]) -> None:
     for idx, (g, alg) in enumerate(zip(graphs, algs_for_graph)):
         graph_id = _graph_id_from_index(alg, _SPLIT.value, idx)
         
-        # Get task-specific tokenization using original method first
         task_map = task.tokenize_graph(g, graph_id)
         samples = task_map[graph_id]
         
-        # For each sample, get the task-specific tokenization
         tokens_list = []
         try:
-            # Tokenize the base graph once
             base_tokens = auto_tokenizer.tokenize(g)
-            # Use the same tokens for all samples since EdgeExistence doesn't modify the graph
             for _ in samples:
-                tokens_list.append(base_tokens.tolist())  # Convert tensor to list for JSON serialization
+                tokens_list.append(base_tokens.tolist())
         except Exception as e:
             logging.warning(f"Failed to tokenize graph {graph_id}: {str(e)}")
-            # Use empty token list as fallback
             tokens_list.extend([[] for _ in samples])
         
-        # Create records with task-specific format
         records = [
             {
                 "graph_id": graph_id,
-                "text": sample,  # Keep original text format
-                "tokens": tokens  # Add AutoGraph tokens
+                "text": sample,
+                "tokens": tokens
             }
             for sample, tokens in zip(samples, tokens_list)
         ]
