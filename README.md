@@ -56,6 +56,10 @@ The project includes several key submodules that work together with these benchm
 - **requirements.txt**
   - Lists the Python dependencies required to run the scripts in this directory.
 
+- **mpnn.py**
+  - Implements a GIN-style MPNN baseline using PyTorch Geometric.
+  - Loads synthetic AutoGraph task files, rebuilds each graph, and trains a message-passing model for regression or classification.
+
 ## Usage
 
 1. **Install dependencies**
