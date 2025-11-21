@@ -70,15 +70,42 @@ def main():
     args = parser.parse_args()
     add_repo_path()
 
-    # Load optional per-model config JSON (overrides per model)
+    # Auto-discover model config if not explicitly provided. Prefer YAML.
+    if not args.model_config:
+        # look for common locations under the benchmarks/ folder
+        candidates = [
+            Path(__file__).resolve().parent / "model_configs.yaml",
+        ]
+        for p in candidates:
+            if p.exists():
+                args.model_config = str(p)
+                print(f"Auto-detected model_config: {args.model_config}")
+                break
+
+    # Load optional per-model config (JSON or YAML) (overrides per model).
     model_cfg = {}
     if args.model_config:
         try:
             with open(args.model_config, 'r') as f:
-                model_cfg = json.load(f)
+                txt = f.read()
         except Exception as e:
-            print(f"Failed to load model_config {args.model_config}: {e}")
-            model_cfg = {}
+            print(f"Failed to open model_config {args.model_config}: {e}")
+            txt = None
+
+        if txt:
+            # Try JSON first, then YAML if JSON parsing fails.
+            try:
+                model_cfg = json.loads(txt)
+            except Exception:
+                try:
+                    import yaml  # lazy import to avoid hard dependency
+                    model_cfg = yaml.safe_load(txt) or {}
+                except ModuleNotFoundError:
+                    print("PyYAML not installed; install with 'pip install pyyaml' to use YAML model configs")
+                    model_cfg = {}
+                except Exception as e:
+                    print(f"Failed to parse model_config {args.model_config} as YAML: {e}")
+                    model_cfg = {}
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
