@@ -56,16 +56,6 @@ def main():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output_dir", type=str, default="./models")
     parser.add_argument("--model_config", type=str, default=None, help="Path to JSON file with per-model overrides")
-    # model hyperparams
-    parser.add_argument("--hidden_dim", type=int, default=64)
-    parser.add_argument("--num_layers", type=int, default=4)
-    parser.add_argument("--d_model", type=int, default=256)
-    parser.add_argument("--n_heads", type=int, default=8)
-    parser.add_argument("--d_ff", type=int, default=1024)
-    parser.add_argument("--n_layers", type=int, default=6)
-    parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--max_seq_length", type=int, default=512)
-    parser.add_argument("--log_model", action="store_true")
 
     args = parser.parse_args()
     add_repo_path()
