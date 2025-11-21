@@ -10,142 +10,34 @@ Run example:
 """
 
 from pathlib import Path
-import sys
 import argparse
 import time
 import json
 
 import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-
 import wandb
 
-
-def add_repo_path():
-    # Ensure local benchmarks/ modules importable
-    repo_dir = Path(__file__).resolve().parent
-    if str(repo_dir) not in sys.path:
-        sys.path.insert(0, str(repo_dir))
+# Import modular helpers
+from common import add_repo_path, _make_standard_log, _make_standard_test_log
+from builders import build_mpnn as builders_build_mpnn, build_transformer as builders_build_transformer
+from train_utils import train_transformer_epoch as tu_train_transformer_epoch, eval_transformer_epoch as tu_eval_transformer_epoch
 
 
 def build_mpnn(args, device):
-    from mpnn import GraphTaskDataset, GIN, GraphMPNNTrainer, collate_fn
-
-    train_dataset = GraphTaskDataset(args.data_dir, args.task, args.algorithm, "train")
-    valid_dataset = GraphTaskDataset(args.data_dir, args.task, args.algorithm, "valid")
-    test_dataset = GraphTaskDataset(args.data_dir, args.task, args.algorithm, "test")
-
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
-    valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
-
-    model = GIN(in_features=1, hidden_dim=args.hidden_dim, num_layers=args.num_layers, out_features=1, dropout=0.5)
-    task_type = "classification" if args.task in ["cycle_check"] else "regression"
-    trainer = GraphMPNNTrainer(model, learning_rate=args.learning_rate, device=device, task_type=task_type)
-
-    return {
-        "train_loader": train_loader,
-        "valid_loader": valid_loader,
-        "test_loader": test_loader,
-        "trainer": trainer,
-        "task_type": task_type,
-    }
+    return builders_build_mpnn(args, device)
 
 
 def build_transformer(args, device, which):
-    if which == "graph_transformer":
-        from graph_transformer import GraphDataset, GraphTransformer
-
-        Dataset = GraphDataset
-        Transformer = GraphTransformer
-    else:
-        # autograph_transformer
-        from autograph_transformer import GraphDataset as AGDataset, GraphTransformer as AGTransformer
-
-        Dataset = AGDataset
-        Transformer = AGTransformer
-
-    train_dataset = Dataset(args.data_dir, args.task, args.algorithm, "train", max_seq_length=args.max_seq_length)
-    valid_dataset = Dataset(args.data_dir, args.task, args.algorithm, "valid", max_seq_length=args.max_seq_length)
-
-    # Share vocabulary
-    try:
-        valid_dataset.token2idx = train_dataset.token2idx
-        valid_dataset.idx2token = train_dataset.idx2token
-        valid_dataset.vocab_size = train_dataset.vocab_size
-    except Exception:
-        pass
-
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False)
-
-    model = Transformer(vocab_size=train_dataset.vocab_size, d_model=args.d_model, n_heads=args.n_heads, n_layers=args.n_layers, d_ff=args.d_ff, dropout=args.dropout, max_seq_length=args.max_seq_length).to(device)
-
-    return {
-        "train_loader": train_loader,
-        "valid_loader": valid_loader,
-        "model": model,
-    }
+    return builders_build_transformer(args, device, which)
 
 
 def train_transformer_epoch(model, dataloader, optimizer, device):
-    model.train()
-    total_loss = 0.0
-    total_correct = 0
-    total_count = 0
-    for batch in dataloader:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels = batch["label"].to(device)
-
-        logits = model(input_ids, attention_mask)  # (B, S, V)
-        lengths = attention_mask.long().sum(dim=1)
-        p_pos = lengths - 1
-        bsz = input_ids.size(0)
-        logits_at_p = logits[torch.arange(bsz, device=device), p_pos, :]
-
-        loss = F.cross_entropy(logits_at_p, labels)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        preds = logits_at_p.argmax(dim=-1)
-        total_correct += (preds == labels).sum().item()
-        total_loss += loss.item() * bsz
-        total_count += bsz
-
-    avg_loss = total_loss / total_count if total_count > 0 else float('nan')
-    acc = total_correct / total_count if total_count > 0 else float('nan')
-    return avg_loss, acc
+    return tu_train_transformer_epoch(model, dataloader, optimizer, device)
 
 
 @torch.no_grad()
 def eval_transformer_epoch(model, dataloader, device):
-    model.eval()
-    total_loss = 0.0
-    total_correct = 0
-    total_count = 0
-    for batch in dataloader:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels = batch["label"].to(device)
-
-        logits = model(input_ids, attention_mask)
-        lengths = attention_mask.long().sum(dim=1)
-        p_pos = lengths - 1
-        bsz = input_ids.size(0)
-        logits_at_p = logits[torch.arange(bsz, device=device), p_pos, :]
-
-        loss = F.cross_entropy(logits_at_p, labels)
-        preds = logits_at_p.argmax(dim=-1)
-        total_correct += (preds == labels).sum().item()
-        total_loss += loss.item() * bsz
-        total_count += bsz
-
-    avg_loss = total_loss / total_count if total_count > 0 else float('nan')
-    acc = total_correct / total_count if total_count > 0 else float('nan')
-    return avg_loss, acc
+    return tu_eval_transformer_epoch(model, dataloader, device)
 
 
 def main():
@@ -163,6 +55,7 @@ def main():
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output_dir", type=str, default="./models")
+    parser.add_argument("--model_config", type=str, default=None, help="Path to JSON file with per-model overrides")
     # model hyperparams
     parser.add_argument("--hidden_dim", type=int, default=64)
     parser.add_argument("--num_layers", type=int, default=4)
@@ -177,7 +70,15 @@ def main():
     args = parser.parse_args()
     add_repo_path()
 
-    device = torch.device(args.device)
+    # Load optional per-model config JSON (overrides per model)
+    model_cfg = {}
+    if args.model_config:
+        try:
+            with open(args.model_config, 'r') as f:
+                model_cfg = json.load(f)
+        except Exception as e:
+            print(f"Failed to load model_config {args.model_config}: {e}")
+            model_cfg = {}
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -192,43 +93,40 @@ def main():
     # Group identifier for wandb comparisons
     group_id = args.group or f"bench-{int(time.time())}"
 
-    def _make_standard_log(epoch, model_name, task_type, train_metrics, valid_metrics):
-        # Ensure consistent keys for wandb across all models. Values may be None
-        # when not applicable or not provided by the underlying trainer.
-        return {
-            "epoch": epoch + 1,
-            "model": model_name,
-            "train_loss": train_metrics.get("loss") if train_metrics else None,
-            "valid_loss": valid_metrics.get("loss") if valid_metrics else None,
-            "train_accuracy": train_metrics.get("accuracy") if (train_metrics and task_type == "classification") else None,
-            "valid_accuracy": valid_metrics.get("accuracy") if (valid_metrics and task_type == "classification") else None,
-            "train_mae": train_metrics.get("mae") if (train_metrics and task_type != "classification") else None,
-            "valid_mae": valid_metrics.get("mae") if (valid_metrics and task_type != "classification") else None,
-        }
-
     for model_name in models_to_run:
-        # Make per-model unique run names. If the caller provided --run_name,
-        # append the model name and a timestamp to avoid collisions. Otherwise
-        # fall back to the default naming that includes task and timestamp.
-        if args.run_name:
-            run_name = f"{args.run_name}-{model_name}-{int(time.time())}"
+        # Merge per-model overrides into a fresh args namespace so each model
+        # run receives its own hyperparameters.
+        overrides = model_cfg.get(model_name, {}) if model_cfg else {}
+        model_vars = vars(args).copy()
+        # Apply overrides (shallow merge)
+        model_vars.update(overrides)
+        # Create a Namespace for builder convenience
+        model_args = argparse.Namespace(**model_vars)
+
+        # Make per-model unique run names. If the caller provided --run_name (or
+        # the model config provided one), append the model name and timestamp.
+        if getattr(model_args, 'run_name', None):
+            run_name = f"{model_args.run_name}-{model_name}-{int(time.time())}"
         else:
-            run_name = f"{model_name}-{args.task}-{int(time.time())}"
+            run_name = f"{model_name}-{model_args.task}-{int(time.time())}"
 
         # Check that the task data exists before starting a run
-        train_dir = Path(args.data_dir) / "tasks_autograph" / args.task / args.algorithm / "train"
+        train_dir = Path(model_args.data_dir) / "tasks_autograph" / model_args.task / model_args.algorithm / "train"
         if not train_dir.exists():
-            print(f"Data not found for task '{args.task}/{args.algorithm}' at: {train_dir}. Skipping model '{model_name}'.")
+            print(f"Data not found for task '{model_args.task}/{model_args.algorithm}' at: {train_dir}. Skipping model '{model_name}'.")
             continue
 
         # initialize a separate wandb run per model, grouped together
-        wandb.init(project=args.project, name=run_name, group=group_id, config=vars(args))
+        wandb.init(project=model_args.project, name=run_name, group=group_id, config=vars(model_args))
+
+        # Resolve device per-model (allow overrides in model config)
+        device = torch.device(model_args.device)
 
         best_valid = float("inf")
         best_path = out_dir / f"{model_name}_best.pt"
 
         if model_name == "mpnn":
-            v = build_mpnn(args, device)
+            v = build_mpnn(model_args, device)
             trainer = v["trainer"]
             train_loader = v["train_loader"]
             valid_loader = v["valid_loader"]
@@ -253,12 +151,7 @@ def main():
             # load best and evaluate test
             trainer.load_checkpoint(str(best_path))
             test_metrics = trainer.evaluate(test_loader)
-            wandb.log({
-                "model": model_name,
-                "test_loss": test_metrics.get("loss"),
-                "test_mae": test_metrics.get("mae", None),
-                "test_accuracy": test_metrics.get("accuracy", None),
-            })
+            wandb.log(_make_standard_test_log(model_name, v["task_type"], test_metrics))
 
             if args.log_model:
                 wandb.save(str(best_path))
@@ -267,7 +160,7 @@ def main():
             # lightweight GraphGPS baseline
             from graphgps import build_graphgps
 
-            v = build_graphgps(args, device)
+            v = build_graphgps(model_args, device)
             trainer = v["trainer"]
             train_loader = v["train_loader"]
             valid_loader = v["valid_loader"]
@@ -291,18 +184,13 @@ def main():
 
             trainer.load_checkpoint(str(best_path))
             test_metrics = trainer.evaluate(test_loader)
-            wandb.log({
-                "model": model_name,
-                "test_loss": test_metrics.get("loss"),
-                "test_mae": test_metrics.get("mae", None),
-                "test_accuracy": test_metrics.get("accuracy", None),
-            })
+            wandb.log(_make_standard_test_log(model_name, v["task_type"], test_metrics))
 
             if args.log_model:
                 wandb.save(str(best_path))
 
         else:
-            v = build_transformer(args, device, model_name)
+            v = build_transformer(model_args, device, model_name)
             model = v["model"]
             train_loader = v["train_loader"]
             valid_loader = v["valid_loader"]
@@ -327,6 +215,18 @@ def main():
                     best_valid = valid_loss
                     torch.save(model.state_dict(), str(best_path))
 
+            # load best and evaluate test set for transformer
+            try:
+                model.load_state_dict(torch.load(str(best_path)))
+                test_loader = v.get("test_loader")
+                if test_loader is not None:
+                    test_loss, test_acc = eval_transformer_epoch(model, test_loader, device)
+                    test_metrics = {"loss": test_loss, "accuracy": test_acc}
+                    wandb.log(_make_standard_test_log(model_name, "classification", test_metrics))
+            except Exception:
+                # If loading or evaluation fails, log nothing but continue
+                pass
+
             # final test/validation snapshot
             if args.log_model:
                 wandb.save(str(best_path))
@@ -334,7 +234,7 @@ def main():
         # Save run config for this model and finish the wandb run
         cfg_path = out_dir / f"{run_name}_config.json"
         with cfg_path.open("w") as f:
-            json.dump(vars(args), f, indent=2)
+            json.dump(vars(model_args), f, indent=2)
         wandb.save(str(cfg_path))
         wandb.finish()
 
