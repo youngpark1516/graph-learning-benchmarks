@@ -150,7 +150,9 @@ def eval_transformer_epoch(model, dataloader, device):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, choices=["mpnn", "graph_transformer", "autograph_transformer"], required=True)
+    parser.add_argument("--model", type=str, choices=["mpnn", "graph_transformer", "autograph_transformer", "graphgps"], required=False)
+    parser.add_argument("--models", type=str, default=None, help="Comma-separated list of models to run (overrides --model).")
+    parser.add_argument("--group", type=str, default=None, help="WandB group name to group model runs for comparison.")
     parser.add_argument("--data_dir", type=str, default="/data/young/capstone/graph-learning-benchmarks/submodules/graph-token")
     parser.add_argument("--task", type=str, default="edge_count")
     parser.add_argument("--algorithm", type=str, default="ba")
@@ -179,75 +181,162 @@ def main():
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Setup wandb
-    run_name = args.run_name or f"{args.model}-{args.task}-{int(time.time())}"
-    wandb.init(project=args.project, name=run_name, config=vars(args))
-
-    best_valid = float("inf")
-    best_path = out_dir / f"{args.model}_best.pt"
-
-    if args.model == "mpnn":
-        v = build_mpnn(args, device)
-        trainer = v["trainer"]
-        train_loader = v["train_loader"]
-        valid_loader = v["valid_loader"]
-        test_loader = v["test_loader"]
-
-        for epoch in range(args.epochs):
-            train_loss = trainer.train_epoch(train_loader)
-            valid_metrics = trainer.evaluate(valid_loader)
-            valid_loss = valid_metrics.get("loss", float("nan"))
-
-            logd = {"epoch": epoch + 1, "train_loss": train_loss, "valid_loss": valid_loss}
-            if v["task_type"] == "classification":
-                logd["valid_accuracy"] = valid_metrics.get("accuracy")
-            else:
-                logd["valid_mae"] = valid_metrics.get("mae")
-
-            wandb.log(logd)
-
-            if valid_loss < best_valid:
-                best_valid = valid_loss
-                trainer.save_checkpoint(str(best_path))
-
-        # load best and evaluate test
-        trainer.load_checkpoint(str(best_path))
-        test_metrics = trainer.evaluate(test_loader)
-        wandb.log({"test_loss": test_metrics.get("loss"), "test_mae": test_metrics.get("mae", None), "test_accuracy": test_metrics.get("accuracy", None)})
-
-        if args.log_model:
-            wandb.save(str(best_path))
-
+    # Determine which models to run
+    if args.models:
+        models_to_run = [m.strip() for m in args.models.split(",") if m.strip()]
+    elif args.model:
+        models_to_run = [args.model]
     else:
-        v = build_transformer(args, device, args.model)
-        model = v["model"]
-        train_loader = v["train_loader"]
-        valid_loader = v["valid_loader"]
+        models_to_run = ["mpnn", "graph_transformer", "autograph_transformer", "graphgps"]
 
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.epochs))
+    # Group identifier for wandb comparisons
+    group_id = args.group or f"bench-{int(time.time())}"
 
-        for epoch in range(args.epochs):
-            train_loss, train_acc = train_transformer_epoch(model, train_loader, optimizer, device)
-            valid_loss, valid_acc = eval_transformer_epoch(model, valid_loader, device)
-            scheduler.step()
+    def _make_standard_log(epoch, model_name, task_type, train_metrics, valid_metrics):
+        # Ensure consistent keys for wandb across all models. Values may be None
+        # when not applicable or not provided by the underlying trainer.
+        return {
+            "epoch": epoch + 1,
+            "model": model_name,
+            "train_loss": train_metrics.get("loss") if train_metrics else None,
+            "valid_loss": valid_metrics.get("loss") if valid_metrics else None,
+            "train_accuracy": train_metrics.get("accuracy") if (train_metrics and task_type == "classification") else None,
+            "valid_accuracy": valid_metrics.get("accuracy") if (valid_metrics and task_type == "classification") else None,
+            "train_mae": train_metrics.get("mae") if (train_metrics and task_type != "classification") else None,
+            "valid_mae": valid_metrics.get("mae") if (valid_metrics and task_type != "classification") else None,
+        }
 
-            wandb.log({"epoch": epoch + 1, "train_loss": train_loss, "train_acc": train_acc, "valid_loss": valid_loss, "valid_acc": valid_acc})
+    for model_name in models_to_run:
+        # Make per-model unique run names. If the caller provided --run_name,
+        # append the model name and a timestamp to avoid collisions. Otherwise
+        # fall back to the default naming that includes task and timestamp.
+        if args.run_name:
+            run_name = f"{args.run_name}-{model_name}-{int(time.time())}"
+        else:
+            run_name = f"{model_name}-{args.task}-{int(time.time())}"
 
-            # save best
-            if valid_loss < best_valid:
-                best_valid = valid_loss
-                torch.save(model.state_dict(), str(best_path))
+        # Check that the task data exists before starting a run
+        train_dir = Path(args.data_dir) / "tasks_autograph" / args.task / args.algorithm / "train"
+        if not train_dir.exists():
+            print(f"Data not found for task '{args.task}/{args.algorithm}' at: {train_dir}. Skipping model '{model_name}'.")
+            continue
 
-        # final test/validation snapshot
-        wandb.save(str(best_path)) if args.log_model else None
+        # initialize a separate wandb run per model, grouped together
+        wandb.init(project=args.project, name=run_name, group=group_id, config=vars(args))
 
-    # Save run config and finish
-    cfg_path = out_dir / f"{run_name}_config.json"
-    with cfg_path.open("w") as f:
-        json.dump(vars(args), f, indent=2)
-    wandb.save(str(cfg_path))
-    wandb.finish()
+        best_valid = float("inf")
+        best_path = out_dir / f"{model_name}_best.pt"
+
+        if model_name == "mpnn":
+            v = build_mpnn(args, device)
+            trainer = v["trainer"]
+            train_loader = v["train_loader"]
+            valid_loader = v["valid_loader"]
+            test_loader = v["test_loader"]
+
+            for epoch in range(args.epochs):
+                # train step
+                _ = trainer.train_epoch(train_loader)
+
+                # Gather consistent train/valid metrics dictionaries
+                train_metrics = trainer.evaluate(train_loader)
+                valid_metrics = trainer.evaluate(valid_loader)
+
+                logd = _make_standard_log(epoch, model_name, v["task_type"], train_metrics, valid_metrics)
+                wandb.log(logd)
+
+                valid_loss = valid_metrics.get("loss", float("inf"))
+                if valid_loss < best_valid:
+                    best_valid = valid_loss
+                    trainer.save_checkpoint(str(best_path))
+
+            # load best and evaluate test
+            trainer.load_checkpoint(str(best_path))
+            test_metrics = trainer.evaluate(test_loader)
+            wandb.log({
+                "model": model_name,
+                "test_loss": test_metrics.get("loss"),
+                "test_mae": test_metrics.get("mae", None),
+                "test_accuracy": test_metrics.get("accuracy", None),
+            })
+
+            if args.log_model:
+                wandb.save(str(best_path))
+
+        elif model_name == "graphgps":
+            # lightweight GraphGPS baseline
+            from graphgps import build_graphgps
+
+            v = build_graphgps(args, device)
+            trainer = v["trainer"]
+            train_loader = v["train_loader"]
+            valid_loader = v["valid_loader"]
+            test_loader = v["test_loader"]
+
+            for epoch in range(args.epochs):
+                # train step
+                _ = trainer.train_epoch(train_loader)
+
+                # Gather consistent train/valid metrics dictionaries
+                train_metrics = trainer.evaluate(train_loader)
+                valid_metrics = trainer.evaluate(valid_loader)
+
+                logd = _make_standard_log(epoch, model_name, v["task_type"], train_metrics, valid_metrics)
+                wandb.log(logd)
+
+                valid_loss = valid_metrics.get("loss", float("inf"))
+                if valid_loss < best_valid:
+                    best_valid = valid_loss
+                    trainer.save_checkpoint(str(best_path))
+
+            trainer.load_checkpoint(str(best_path))
+            test_metrics = trainer.evaluate(test_loader)
+            wandb.log({
+                "model": model_name,
+                "test_loss": test_metrics.get("loss"),
+                "test_mae": test_metrics.get("mae", None),
+                "test_accuracy": test_metrics.get("accuracy", None),
+            })
+
+            if args.log_model:
+                wandb.save(str(best_path))
+
+        else:
+            v = build_transformer(args, device, model_name)
+            model = v["model"]
+            train_loader = v["train_loader"]
+            valid_loader = v["valid_loader"]
+
+            optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.epochs))
+
+            for epoch in range(args.epochs):
+                train_loss, train_acc = train_transformer_epoch(model, train_loader, optimizer, device)
+                valid_loss, valid_acc = eval_transformer_epoch(model, valid_loader, device)
+                scheduler.step()
+
+                # Build standardized metric dicts for transformer
+                train_metrics = {"loss": train_loss, "accuracy": train_acc}
+                valid_metrics = {"loss": valid_loss, "accuracy": valid_acc}
+
+                logd = _make_standard_log(epoch, model_name, "classification", train_metrics, valid_metrics)
+                wandb.log(logd)
+
+                # save best
+                if valid_loss < best_valid:
+                    best_valid = valid_loss
+                    torch.save(model.state_dict(), str(best_path))
+
+            # final test/validation snapshot
+            if args.log_model:
+                wandb.save(str(best_path))
+
+        # Save run config for this model and finish the wandb run
+        cfg_path = out_dir / f"{run_name}_config.json"
+        with cfg_path.open("w") as f:
+            json.dump(vars(args), f, indent=2)
+        wandb.save(str(cfg_path))
+        wandb.finish()
 
 
 if __name__ == "__main__":
