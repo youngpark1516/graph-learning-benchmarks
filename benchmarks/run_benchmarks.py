@@ -56,9 +56,27 @@ def main():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output_dir", type=str, default="./models")
     parser.add_argument("--model_config", type=str, default=None, help="Path to JSON file with per-model overrides")
+    parser.add_argument("--log_model", action="store_true", help="Save best model artifact for each run")
 
     args = parser.parse_args()
     add_repo_path()
+
+    # Default values used when a per-model config or CLI doesn't provide them.
+    DEFAULT_MODEL_ARGS = {
+        "hidden_dim": 64,
+        "num_layers": 4,
+        "d_model": 256,
+        "n_heads": 8,
+        "d_ff": 1024,
+        "n_layers": 6,
+        "dropout": 0.1,
+        "max_seq_length": 512,
+        "batch_size": 32,
+        "learning_rate": 1e-3,
+        "epochs": 10,
+        "log_model": False,
+        "run_name": None,
+    }
 
     # Auto-discover model config if not explicitly provided. Prefer YAML.
     if not args.model_config:
@@ -117,6 +135,9 @@ def main():
         model_vars = vars(args).copy()
         # Apply overrides (shallow merge)
         model_vars.update(overrides)
+        # Ensure defaults exist so the per-model Namespace has all expected attributes
+        for k, v in DEFAULT_MODEL_ARGS.items():
+            model_vars.setdefault(k, v)
         # Create a Namespace for builder convenience
         model_args = argparse.Namespace(**model_vars)
 
@@ -149,7 +170,7 @@ def main():
             valid_loader = v["valid_loader"]
             test_loader = v["test_loader"]
 
-            for epoch in range(args.epochs):
+            for epoch in range(model_args.epochs):
                 # train step
                 _ = trainer.train_epoch(train_loader)
 
@@ -170,7 +191,7 @@ def main():
             test_metrics = trainer.evaluate(test_loader)
             wandb.log(_make_standard_test_log(model_name, v["task_type"], test_metrics))
 
-            if args.log_model:
+            if getattr(model_args, 'log_model', False):
                 wandb.save(str(best_path))
 
         elif model_name == "graphgps":
@@ -183,7 +204,7 @@ def main():
             valid_loader = v["valid_loader"]
             test_loader = v["test_loader"]
 
-            for epoch in range(args.epochs):
+            for epoch in range(model_args.epochs):
                 # train step
                 _ = trainer.train_epoch(train_loader)
 
@@ -203,7 +224,7 @@ def main():
             test_metrics = trainer.evaluate(test_loader)
             wandb.log(_make_standard_test_log(model_name, v["task_type"], test_metrics))
 
-            if args.log_model:
+            if getattr(model_args, 'log_model', False):
                 wandb.save(str(best_path))
 
         else:
@@ -212,10 +233,10 @@ def main():
             train_loader = v["train_loader"]
             valid_loader = v["valid_loader"]
 
-            optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.epochs))
+            optimizer = torch.optim.Adam(model.parameters(), lr=model_args.learning_rate)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, model_args.epochs))
 
-            for epoch in range(args.epochs):
+            for epoch in range(model_args.epochs):
                 train_loss, train_acc = train_transformer_epoch(model, train_loader, optimizer, device)
                 valid_loss, valid_acc = eval_transformer_epoch(model, valid_loader, device)
                 scheduler.step()
@@ -245,7 +266,7 @@ def main():
                 pass
 
             # final test/validation snapshot
-            if args.log_model:
+            if getattr(model_args, 'log_model', False):
                 wandb.save(str(best_path))
 
         # Save run config for this model and finish the wandb run

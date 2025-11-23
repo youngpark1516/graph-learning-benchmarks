@@ -1,6 +1,3 @@
-# Per-model hyperparameter overrides used by run_benchmarks.py (--model_config)
-# Each top-level key is the model name; values override CLI args for that model.
-
 mpnn:
   hidden_dim: 128
   num_layers: 4
@@ -10,29 +7,29 @@ mpnn:
   run_name: mpnn-medium
 
 graph_transformer:
-  d_model: 256
-  n_layers: 6
-  n_heads: 8
-  d_ff: 1024
+  d_model: 32
+  n_layers: 2
+  n_heads: 1
+  d_ff: 16
   batch_size: 32
-  learning_rate: 0.0003
+  learning_rate: 0.0001
   device: cuda
   run_name: gtransformer-medium
 
 autograph_transformer:
-  d_model: 256
-  n_layers: 6
-  n_heads: 8
-  d_ff: 1024
+  d_model: 32
+  n_layers: 2
+  n_heads: 1
+  d_ff: 16
   batch_size: 32
-  learning_rate: 0.0003
+  learning_rate: 0.0001
   device: cuda
   run_name: autograph-medium
 
 graphgps:
-  d_model: 256
-  n_layers: 6
-  hidden_dim: 256
+  d_model: 32
+  n_layers: 2
+  hidden_dim: 16
   batch_size: 32
   learning_rate: 0.001
   device: cuda
