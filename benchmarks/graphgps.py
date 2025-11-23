@@ -39,13 +39,23 @@ def build_graphgps(args, device: str):
     task = args.task
     algorithm = args.algorithm
 
+    # Respect a broad set of configuration keys so `graphgps` can be
+    # configured similarly to `mpnn` and transformer models.
+    batch_size = getattr(args, "batch_size", 32)
+    learning_rate = getattr(args, "learning_rate", 1e-3)
+    hidden_dim = getattr(args, "hidden_dim", None) or getattr(args, "d_model", 64)
+    # Accept either `num_layers` (mpnn style) or `n_layers` (transformer style).
+    n_layers = max(1, getattr(args, "num_layers", None) or getattr(args, "n_layers", 3))
+    n_heads = getattr(args, "n_heads", 4)
+    dropout = getattr(args, "dropout", 0.1)
+
     train_dataset = GraphTaskDataset(data_dir, task, algorithm, "train")
     valid_dataset = GraphTaskDataset(data_dir, task, algorithm, "valid")
     test_dataset = GraphTaskDataset(data_dir, task, algorithm, "test")
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
-    valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
     class SimpleGPS(nn.Module):
         def __init__(self, in_channels=1, hidden_dim=64, n_layers=3, n_heads=4, out_dim=1, dropout=0.1):
@@ -53,7 +63,7 @@ def build_graphgps(args, device: str):
             self.input_lin = nn.Linear(in_channels, hidden_dim)
             self.convs = nn.ModuleList()
             for _ in range(n_layers):
-                self.convs.append(TransformerConv(hidden_dim, hidden_dim // n_heads, heads=n_heads, dropout=dropout))
+                self.convs.append(TransformerConv(hidden_dim, max(1, hidden_dim // n_heads), heads=n_heads, dropout=dropout))
             self.pool = global_mean_pool
             self.mlp = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Dropout(dropout), nn.Linear(hidden_dim, out_dim))
 
@@ -67,7 +77,7 @@ def build_graphgps(args, device: str):
             out = self.mlp(x)
             return out
 
-    model = SimpleGPS(in_channels=1, hidden_dim=getattr(args, "hidden_dim", 64), n_layers=max(2, getattr(args, "num_layers", 3)), n_heads=4, out_dim=1, dropout=0.1)
+    model = SimpleGPS(in_channels=1, hidden_dim=hidden_dim, n_layers=n_layers, n_heads=n_heads, out_dim=1, dropout=dropout)
     model = model.to(device)
 
     class Trainer:
