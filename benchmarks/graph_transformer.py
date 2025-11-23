@@ -4,6 +4,7 @@
 """Transformer model for text-only up to <p>, predicting the token after <p>."""
 
 import json
+import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -23,12 +24,16 @@ class GraphDataset(Dataset):
         algorithm: str,
         split: str,
         max_seq_length: int = 512,
+        n_samples_per_file: int = -1,
+        sampling_seed: int | None = None,
     ):
         self.data_dir = Path(data_dir)
         self.task = task
         self.algorithm = algorithm
         self.split = split
         self.max_seq_length = max_seq_length
+        self.n_samples_per_file = n_samples_per_file
+        self.sampling_seed = sampling_seed
 
         self.samples = self._load_samples()
         self.token2idx = {"[PAD]": 0, "[CLS]": 1, "[SEP]": 2, "[UNK]": 3}
@@ -39,9 +44,17 @@ class GraphDataset(Dataset):
     def _load_samples(self) -> List[dict]:
         task_dir = self.data_dir / "tasks_autograph" / self.task / self.algorithm / self.split
         samples = []
-        for json_file in task_dir.glob("*.json"):
+        rng = random.Random(self.sampling_seed) if self.sampling_seed is not None else random
+        for json_file in sorted(task_dir.glob("*.json")):
             with json_file.open() as f:
-                samples.extend(json.load(f))
+                file_samples = json.load(f)
+                if isinstance(file_samples, list) and self.n_samples_per_file and self.n_samples_per_file > 0:
+                    k = min(len(file_samples), int(self.n_samples_per_file))
+                    # sample without replacement
+                    chosen = rng.sample(file_samples, k)
+                    samples.extend(chosen)
+                else:
+                    samples.extend(file_samples)
         return samples
 
     def _build_vocabulary(self):

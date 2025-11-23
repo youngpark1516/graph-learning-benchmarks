@@ -81,14 +81,33 @@ def build_graphgps(args, device: str):
     model = model.to(device)
 
     class Trainer:
-        def __init__(self, model, lr=1e-3, device="cpu", task_type="regression"):
+        def __init__(self, model, lr=1e-3, device="cpu", task_type="regression", loss: str | None = None):
             self.model = model
             self.device = torch.device(device)
             self.model.to(self.device)
             self.opt = torch.optim.Adam(self.model.parameters(), lr=lr)
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.opt, T_max=100)
             self.task_type = task_type
-            self.loss_fn = nn.BCEWithLogitsLoss() if task_type == "classification" else nn.MSELoss()
+
+            # Configure loss function based on provided loss name or sensible defaults
+            loss_name = (loss or "").lower() if loss is not None else None
+            if loss_name:
+                if loss_name in ("bce", "bcewithlogits", "bce_with_logits"):
+                    self.loss_fn = nn.BCEWithLogitsLoss()
+                elif loss_name in ("mse", "mse_loss"):
+                    self.loss_fn = nn.MSELoss()
+                elif loss_name in ("mae", "l1", "l1loss"):
+                    self.loss_fn = nn.L1Loss()
+                elif loss_name in ("rmse",):
+                    def _rmse(pred, target):
+                        mse = nn.MSELoss()(pred, target)
+                        return torch.sqrt(mse + 1e-8)
+
+                    self.loss_fn = _rmse
+                else:
+                    self.loss_fn = nn.BCEWithLogitsLoss() if task_type == "classification" else nn.MSELoss()
+            else:
+                self.loss_fn = nn.BCEWithLogitsLoss() if task_type == "classification" else nn.MSELoss()
 
         def train_epoch(self, loader: DataLoader) -> float:
             self.model.train()
@@ -142,7 +161,13 @@ def build_graphgps(args, device: str):
             self.model.load_state_dict(torch.load(path, map_location=self.device))
 
     task_type = "classification" if task in ["cycle_check"] else "regression"
-    trainer = Trainer(model, lr=getattr(args, "learning_rate", 1e-3), device=device, task_type=task_type)
+    trainer = Trainer(
+        model,
+        lr=getattr(args, "learning_rate", 1e-3),
+        device=device,
+        task_type=task_type,
+        loss=getattr(args, "loss", None),
+    )
 
     return {
         "train_loader": train_loader,

@@ -1,6 +1,7 @@
 """Transformer model for processing graph task data."""
 
 import json
+import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -22,7 +23,9 @@ class GraphDataset(Dataset):
         algorithm: str,
         split: str,
         max_seq_length: int = 512,
-        max_text_length: int = 128
+        max_text_length: int = 128,
+        n_samples_per_file: int = -1,
+        sampling_seed: int | None = None,
     ):
         self.data_dir = Path(data_dir)
         self.task = task
@@ -30,9 +33,11 @@ class GraphDataset(Dataset):
         self.split = split
         self.max_seq_length = max_seq_length
         self.max_text_length = max_text_length
-        
+        self.n_samples_per_file = n_samples_per_file
+        self.sampling_seed = sampling_seed
+
+        # Load samples (possibly sampled per-file) then build vocabulary
         self.samples = self._load_samples()
-        
         self.token2idx = {"[PAD]": 0, "[CLS]": 1, "[SEP]": 2}
         self._build_vocabulary()
 
@@ -40,12 +45,16 @@ class GraphDataset(Dataset):
         """Load all JSON files for the specified task/algorithm/split."""
         task_dir = self.data_dir / "tasks_autograph" / self.task / self.algorithm / self.split
         samples = []
-        
-        for json_file in task_dir.glob("*.json"):
+        rng = random.Random(self.sampling_seed) if self.sampling_seed is not None else random
+        for json_file in sorted(task_dir.glob("*.json")):
             with json_file.open() as f:
                 file_samples = json.load(f)
-                samples.extend(file_samples)
-        
+                if isinstance(file_samples, list) and self.n_samples_per_file and self.n_samples_per_file > 0:
+                    k = min(len(file_samples), int(self.n_samples_per_file))
+                    samples.extend(rng.sample(file_samples, k))
+                else:
+                    samples.extend(file_samples)
+
         return samples
 
     def _build_vocabulary(self):

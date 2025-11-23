@@ -305,6 +305,7 @@ class GraphMPNNTrainer:
         weight_decay: float = 1e-5,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         task_type: str = "regression",
+        loss: str | None = None,
     ):
         """
         Args:
@@ -325,11 +326,29 @@ class GraphMPNNTrainer:
             weight_decay=weight_decay,
         )
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=100)
-        
-        if task_type == "classification":
-            self.loss_fn = nn.BCEWithLogitsLoss()
+        # Allow caller to select loss function. If loss is None, fall back
+        # to sensible defaults per task_type.
+        self.loss_name = (loss or "").lower() if loss is not None else None
+        if self.loss_name:
+            if self.loss_name in ("bce", "bcewithlogits", "bce_with_logits"):
+                self.loss_fn = nn.BCEWithLogitsLoss()
+            elif self.loss_name in ("mse", "mse_loss"):
+                self.loss_fn = nn.MSELoss()
+            elif self.loss_name in ("mae", "l1", "l1loss"):
+                self.loss_fn = nn.L1Loss()
+            elif self.loss_name in ("rmse",):
+                # RMSE training: take sqrt of MSE (add eps for numerical stability)
+                def _rmse(pred, target):
+                    mse = nn.MSELoss()(pred, target)
+                    return torch.sqrt(mse + 1e-8)
+
+                self.loss_fn = _rmse
+            else:
+                # Unknown loss name - fallback to defaults
+                self.loss_fn = nn.BCEWithLogitsLoss() if task_type == "classification" else nn.MSELoss()
         else:
-            self.loss_fn = nn.MSELoss()
+            # Default behavior: BCE for classification, MSE for regression
+            self.loss_fn = nn.BCEWithLogitsLoss() if task_type == "classification" else nn.MSELoss()
     
     def train_epoch(self, dataloader: DataLoader) -> float:
         """Train for one epoch.

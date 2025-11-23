@@ -31,13 +31,13 @@ def build_transformer(args, device, which):
     return builders_build_transformer(args, device, which)
 
 
-def train_transformer_epoch(model, dataloader, optimizer, device):
-    return tu_train_transformer_epoch(model, dataloader, optimizer, device)
+def train_transformer_epoch(model, dataloader, optimizer, device, loss_name: str | None = None):
+    return tu_train_transformer_epoch(model, dataloader, optimizer, device, loss_name=loss_name)
 
 
 @torch.no_grad()
-def eval_transformer_epoch(model, dataloader, device):
-    return tu_eval_transformer_epoch(model, dataloader, device)
+def eval_transformer_epoch(model, dataloader, device, loss_name: str | None = None):
+    return tu_eval_transformer_epoch(model, dataloader, device, loss_name=loss_name)
 
 
 def main():
@@ -51,6 +51,7 @@ def main():
     parser.add_argument("--project", type=str, default="graph-benchmarks")
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--loss", type=str, default=None, help="Loss name to use for this run (e.g. mse, mae, rmse, bce, cross_entropy)")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -71,6 +72,9 @@ def main():
         "n_layers": 6,
         "dropout": 0.1,
         "max_seq_length": 512,
+        "n_samples_per_file": -1,
+        "sampling_seed": 1234,
+        "loss": None,
         "batch_size": 32,
         "learning_rate": 1e-3,
         "epochs": 10,
@@ -114,6 +118,14 @@ def main():
                 except Exception as e:
                     print(f"Failed to parse model_config {args.model_config} as YAML: {e}")
                     model_cfg = {}
+    # Extract top-level `global` config if present. These values will be merged
+    # into each model's per-model overrides (per-model keys win on conflict).
+    global_cfg = {}
+    if isinstance(model_cfg, dict) and 'global' in model_cfg:
+        try:
+            global_cfg = model_cfg.get('global', {}) or {}
+        except Exception:
+            global_cfg = {}
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -131,7 +143,14 @@ def main():
     for model_name in models_to_run:
         # Merge per-model overrides into a fresh args namespace so each model
         # run receives its own hyperparameters.
-        overrides = model_cfg.get(model_name, {}) if model_cfg else {}
+        # Merge `global` config with per-model overrides. Per-model keys override global ones.
+        if isinstance(model_cfg, dict):
+            per_model = model_cfg.get(model_name, {}) or {}
+        else:
+            per_model = {}
+        overrides = dict(global_cfg) if isinstance(global_cfg, dict) else {}
+        if isinstance(per_model, dict):
+            overrides.update(per_model)
         model_vars = vars(args).copy()
         # Apply overrides (shallow merge)
         model_vars.update(overrides)
@@ -170,6 +189,16 @@ def main():
             valid_loader = v["valid_loader"]
             test_loader = v["test_loader"]
 
+            # Compute and log parameter counts for the MPNN model
+            try:
+                model_obj = trainer.model
+                total_params = sum(p.numel() for p in model_obj.parameters())
+                trainable_params = sum(p.numel() for p in model_obj.parameters() if p.requires_grad)
+                print(f"MPNN params: total={total_params}, trainable={trainable_params}")
+                wandb.log({"param_count/total": total_params, "param_count/trainable": trainable_params})
+            except Exception:
+                pass
+
             for epoch in range(model_args.epochs):
                 # train step
                 _ = trainer.train_epoch(train_loader)
@@ -204,6 +233,16 @@ def main():
             valid_loader = v["valid_loader"]
             test_loader = v["test_loader"]
 
+            # Compute and log parameter counts for the GraphGPS model
+            try:
+                model_obj = trainer.model
+                total_params = sum(p.numel() for p in model_obj.parameters())
+                trainable_params = sum(p.numel() for p in model_obj.parameters() if p.requires_grad)
+                print(f"GraphGPS params: total={total_params}, trainable={trainable_params}")
+                wandb.log({"param_count/total": total_params, "param_count/trainable": trainable_params})
+            except Exception:
+                pass
+
             for epoch in range(model_args.epochs):
                 # train step
                 _ = trainer.train_epoch(train_loader)
@@ -233,12 +272,22 @@ def main():
             train_loader = v["train_loader"]
             valid_loader = v["valid_loader"]
 
+            # Compute and log parameter counts for transformer models
+            try:
+                model_obj = model
+                total_params = sum(p.numel() for p in model_obj.parameters())
+                trainable_params = sum(p.numel() for p in model_obj.parameters() if p.requires_grad)
+                print(f"{model_name} params: total={total_params}, trainable={trainable_params}")
+                wandb.log({"param_count/total": total_params, "param_count/trainable": trainable_params})
+            except Exception:
+                pass
+
             optimizer = torch.optim.Adam(model.parameters(), lr=model_args.learning_rate)
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, model_args.epochs))
 
             for epoch in range(model_args.epochs):
-                train_loss, train_acc = train_transformer_epoch(model, train_loader, optimizer, device)
-                valid_loss, valid_acc = eval_transformer_epoch(model, valid_loader, device)
+                train_loss, train_acc = train_transformer_epoch(model, train_loader, optimizer, device, loss_name=getattr(model_args, 'loss', None))
+                valid_loss, valid_acc = eval_transformer_epoch(model, valid_loader, device, loss_name=getattr(model_args, 'loss', None))
                 scheduler.step()
 
                 # Build standardized metric dicts for transformer
