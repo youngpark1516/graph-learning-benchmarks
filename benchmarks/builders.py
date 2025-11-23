@@ -44,6 +44,10 @@ def build_transformer(args, device, which):
         valid_dataset.token2idx = train_dataset.token2idx
         valid_dataset.idx2token = train_dataset.idx2token
         valid_dataset.vocab_size = train_dataset.vocab_size
+        # token-id mismatches between training and test time.
+        test_dataset.token2idx = train_dataset.token2idx
+        test_dataset.idx2token = train_dataset.idx2token
+        test_dataset.vocab_size = train_dataset.vocab_size
     except Exception:
         pass
 
