@@ -5,9 +5,11 @@ global:
   max_samples_train: 500
   max_samples_valid: 200
   max_samples_test: 200
+  loss: cross_entropy
+  eval_metrics: [accuracy]
 
 mpnn:
-  hidden_dim: 128
+  hidden_dim: 64
   num_layers: 4
   run_name: mpnn-medium
 
@@ -29,5 +31,5 @@ graphgps:
   d_model: 32
   n_layers: 2
   n_heads: 1
-  hidden_dim: 16
+  hidden_dim: 32
   run_name: graphgps-medium

@@ -25,19 +25,24 @@ class GraphTaskDataset(Dataset):
         self,
         data_dir: str,
         task: str,
-        algorithm: str,
+        algorithm: str | list,
         split: str,
     ):
         """
         Args:
             data_dir: Root directory containing tasks_autograph data
             task: Task name (e.g., 'node_degree', 'edge_count', 'cycle_check')
-            algorithm: Graph algorithm (e.g., 'ba', 'er', 'sbm')
+            algorithm: Graph algorithm (e.g., 'ba', 'er', 'sbm'). Can also be
+                a list/tuple of algorithms to form a union of datasets.
             split: Data split ('train', 'valid', 'test')
         """
         self.data_dir = Path(data_dir)
         self.task = task
-        self.algorithm = algorithm
+        # normalize algorithm to either str or list
+        if isinstance(algorithm, (list, tuple)):
+            self.algorithm = list(algorithm)
+        else:
+            self.algorithm = algorithm
         self.split = split
         
         self.samples = self._load_samples()
@@ -47,19 +52,29 @@ class GraphTaskDataset(Dataset):
     
     def _load_samples(self) -> List[dict]:
         """Load samples from JSON files."""
-        task_dir = self.data_dir / "tasks_autograph" / self.task / self.algorithm / self.split
         samples = []
-        
-        if not task_dir.exists():
-            raise ValueError(f"Task directory not found: {task_dir}")
-        
-        for json_file in sorted(task_dir.glob("*.json")):
-            with json_file.open() as f:
-                samples.extend(json.load(f))
-        
+
+        base = self.data_dir / "tasks_autograph" / self.task
+
+        # If algorithm is a list, collect samples from each algorithm subfolder
+        algo_list = self.algorithm if isinstance(self.algorithm, (list, tuple)) else [self.algorithm]
+
+        found_any = False
+        for a in algo_list:
+            task_dir = base / a / self.split
+            if not task_dir.exists():
+                continue
+            found_any = True
+            for json_file in sorted(task_dir.glob("*.json")):
+                with json_file.open() as f:
+                    samples.extend(json.load(f))
+
+        if not found_any:
+            raise ValueError(f"Task directory not found for any algorithms {algo_list} under {base}")
+
         if not samples:
-            raise ValueError(f"No samples found in {task_dir}")
-        
+            raise ValueError(f"No samples found for task {self.task} in {base} for algorithms {algo_list}")
+
         return samples
     
     def _parse_graph_from_tokens(self, tokens: List[str]) -> Tuple[nx.Graph, int]:
@@ -414,6 +429,15 @@ class GraphMPNNTrainer:
             else:
                 mae = torch.mean(torch.abs(pred - label))
                 total_mae += mae.item()
+                # Optionally compute accuracy for regression-like tasks when requested
+                # by rounding predictions/labels to nearest integer and comparing.
+                eval_metrics = getattr(self, 'eval_metrics', None) or []
+                if 'accuracy' in [m.lower() for m in (eval_metrics or [])]:
+                    pred_round = torch.round(pred).to(torch.int64)
+                    label_round = torch.round(label).to(torch.int64)
+                    correct = (pred_round == label_round).sum().item()
+                    total_correct += correct
+                    total_samples += label.size(0)
         
         metrics = {
             "loss": total_loss / num_batches if num_batches > 0 else 0.0,
@@ -423,6 +447,9 @@ class GraphMPNNTrainer:
             metrics["accuracy"] = total_correct / total_samples if total_samples > 0 else 0.0
         else:
             metrics["mae"] = total_mae / num_batches if num_batches > 0 else 0.0
+            eval_metrics = getattr(self, 'eval_metrics', None) or []
+            if 'accuracy' in [m.lower() for m in (eval_metrics or [])]:
+                metrics["accuracy"] = total_correct / total_samples if total_samples > 0 else 0.0
         
         return metrics
     

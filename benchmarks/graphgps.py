@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from torch_geometric.nn import TransformerConv, global_mean_pool
+from torch_geometric.nn import TransformerConv, global_mean_pool, GINConv
 import wandb
 
 
@@ -58,18 +58,69 @@ def build_graphgps(args, device: str):
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
     class SimpleGPS(nn.Module):
-        def __init__(self, in_channels=1, hidden_dim=64, n_layers=3, n_heads=4, out_dim=1, dropout=0.1):
+        def __init__(
+            self,
+            in_channels: int = 1,
+            hidden_dim: int = 64,
+            n_layers: int = 3,
+            n_heads: int = 4,
+            out_dim: int = 1,
+            dropout: float = 0.1,
+            mpnn_layers: int = 0,
+            mpnn_hidden_dim: int | None = None,
+        ):
             super().__init__()
-            self.input_lin = nn.Linear(in_channels, hidden_dim)
+            # Optional GIN MPNN front-end
+            self.mpnn_layers_count = int(mpnn_layers or 0)
+            self.mpnn_hidden_dim = int(mpnn_hidden_dim) if mpnn_hidden_dim is not None else None
+
+            if self.mpnn_layers_count > 0:
+                mp_h = self.mpnn_hidden_dim or hidden_dim
+                self.mp_input_lin = nn.Linear(in_channels, mp_h)
+                self.mpnn_gins = nn.ModuleList()
+                self.mpnn_bns = nn.ModuleList()
+                for _ in range(self.mpnn_layers_count):
+                    nn_first = nn.Sequential(nn.Linear(mp_h, mp_h), nn.ReLU(), nn.Linear(mp_h, mp_h))
+                    self.mpnn_gins.append(GINConv(nn_first))
+                    self.mpnn_bns.append(nn.BatchNorm1d(mp_h))
+                # project to transformer hidden dim if needed
+                if mp_h != hidden_dim:
+                    self.mp_to_tr = nn.Linear(mp_h, hidden_dim)
+                else:
+                    self.mp_to_tr = None
+            else:
+                self.mp_input_lin = None
+                self.mpnn_gins = None
+                self.mpnn_bns = None
+                self.mp_to_tr = None
+
+            # Transformer input projection (used when no mpnn front-end)
+            self.input_lin = nn.Linear(in_channels, hidden_dim) if self.mpnn_layers_count == 0 else None
+
+            # Transformer-style convolutions
             self.convs = nn.ModuleList()
             for _ in range(n_layers):
                 self.convs.append(TransformerConv(hidden_dim, max(1, hidden_dim // n_heads), heads=n_heads, dropout=dropout))
+
             self.pool = global_mean_pool
             self.mlp = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Dropout(dropout), nn.Linear(hidden_dim, out_dim))
 
         def forward(self, batch):
             x, edge_index, batch_idx = batch.x, batch.edge_index, batch.batch
-            x = self.input_lin(x)
+
+            # If MPNN front-end is configured, run GIN layers first
+            if self.mpnn_layers_count > 0:
+                x = self.mp_input_lin(x)
+                for gin, bn in zip(self.mpnn_gins, self.mpnn_bns):
+                    x = gin(x, edge_index)
+                    x = bn(x)
+                    x = F.relu(x)
+                    x = F.dropout(x, p=self.mlp[2].p if len(self.mlp) > 2 and isinstance(self.mlp[2], nn.Dropout) else 0.0, training=self.training)
+                if self.mp_to_tr is not None:
+                    x = self.mp_to_tr(x)
+            else:
+                x = self.input_lin(x)
+
             for conv in self.convs:
                 x = conv(x, edge_index)
                 x = F.relu(x)
@@ -77,7 +128,18 @@ def build_graphgps(args, device: str):
             out = self.mlp(x)
             return out
 
-    model = SimpleGPS(in_channels=1, hidden_dim=hidden_dim, n_layers=n_layers, n_heads=n_heads, out_dim=1, dropout=dropout)
+    mpnn_layers = getattr(args, 'mpnn_layers', None) or getattr(args, 'mpnn_num_layers', None) or 0
+    mpnn_hidden = getattr(args, 'mpnn_hidden_dim', None) or hidden_dim
+    model = SimpleGPS(
+        in_channels=1,
+        hidden_dim=hidden_dim,
+        n_layers=n_layers,
+        n_heads=n_heads,
+        out_dim=1,
+        dropout=dropout,
+        mpnn_layers=mpnn_layers,
+        mpnn_hidden_dim=mpnn_hidden,
+    )
     model = model.to(device)
 
     class Trainer:
@@ -145,13 +207,24 @@ def build_graphgps(args, device: str):
                     correct += (p == label).sum().item()
                     samples += label.size(0)
                 else:
-                    total_mae += torch.mean(torch.abs(pred - label)).item()
+                        total_mae += torch.mean(torch.abs(pred - label)).item()
+                        # If caller requested accuracy for regression tasks, compute it
+                        eval_metrics = getattr(self, 'eval_metrics', None) or []
+                        if 'accuracy' in [m.lower() for m in (eval_metrics or [])]:
+                            pred_round = torch.round(pred).to(torch.int64)
+                            label_round = torch.round(label).to(torch.int64)
+                            correct += (pred_round == label_round).sum().item()
+                            samples += label.size(0)
 
             metrics = {"loss": total / n if n > 0 else float('nan')}
             if self.task_type == "classification":
                 metrics["accuracy"] = correct / samples if samples > 0 else float('nan')
             else:
                 metrics["mae"] = total_mae / n if n > 0 else float('nan')
+                # If accuracy was requested for regression tasks, include it
+                eval_metrics = getattr(self, 'eval_metrics', None) or []
+                if 'accuracy' in [m.lower() for m in (eval_metrics or [])]:
+                    metrics["accuracy"] = correct / samples if samples > 0 else float('nan')
             return metrics
 
         def save_checkpoint(self, path: str):
@@ -168,6 +241,11 @@ def build_graphgps(args, device: str):
         task_type=task_type,
         loss=getattr(args, "loss", None),
     )
+    # Propagate eval_metrics from args so Trainer can compute optional metrics
+    try:
+        trainer.eval_metrics = getattr(args, 'eval_metrics', None)
+    except Exception:
+        trainer.eval_metrics = None
 
     return {
         "train_loader": train_loader,
