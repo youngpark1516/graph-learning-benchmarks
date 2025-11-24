@@ -217,415 +217,65 @@ def build_transformer(args, device, which):
 
 
 def build_graphgps(args, device):
-    """Build GraphGPS using the submodule implementation when available.
+    """Attempt to build a GraphGPS run using the repository submodule first,
+    then the `benchmarks/graphgps.py` lightweight fallback.
 
-    Falls back to the lightweight `benchmarks/graphgps.build_graphgps` if the
-    submodule cannot be imported or instantiation fails.
+    This mirrors the behaviour expected by `run_benchmarks.py`: prefer a
+    full-featured `graphgps` package (if available under `submodules/graphgps`
+    or on PYTHONPATH), otherwise use the bundled lightweight implementation.
     """
-    # Reuse dataset and collate_fn from benchmarks/mpnn.py
-    from mpnn import GraphTaskDataset, collate_fn
-
-    batch_size = getattr(args, "batch_size", 32)
-    # Allow `args.algorithm` to be a list/tuple to form a union of datasets
-    def _maybe_concat_taskdataset(split):
-        algo = args.algorithm
-        if isinstance(algo, (list, tuple)):
-            ds_list = [GraphTaskDataset(args.data_dir, args.task, a, split) for a in algo]
-            concat = ConcatDataset(ds_list)
-            first = ds_list[0] if len(ds_list) > 0 else None
-            if first is not None:
-                for attr in ('token2idx', 'idx2token', 'vocab_size'):
-                    if hasattr(first, attr):
-                        val = getattr(first, attr)
-                        setattr(concat, attr, val)
-                        for ds in ds_list:
-                            try:
-                                setattr(ds, attr, val)
-                            except Exception:
-                                pass
-            return concat
-        else:
-            return GraphTaskDataset(args.data_dir, args.task, algo, split)
-
-    train_dataset = _maybe_concat_taskdataset("train")
-    valid_dataset = _maybe_concat_taskdataset("valid")
-    test_dataset = _maybe_concat_taskdataset("test")
-
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-    valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
-
-    # Try to use repository submodule first (deterministic). If not present
-    # or loading fails, fall back to top-level import attempt. Print clear
-    # diagnostics so users know why the lightweight fallback was chosen.
+    # Normalize device to a string for downstream builders that expect it
     try:
-        import traceback
-        repo_root = Path(__file__).resolve().parents[1]
-        candidate = repo_root / "submodules" / "graphgps" / "graphgps" / "__init__.py"
-        use_submodule = False
-        if candidate.exists():
-            print(f"Found graphgps submodule at: {candidate}; attempting to load it")
-            try:
-                spec = importlib.util.spec_from_file_location("graphgps", str(candidate))
-                module = importlib.util.module_from_spec(spec)
-                sys.modules["graphgps"] = module
-                spec.loader.exec_module(module)  # type: ignore
-                from graphgps.network.gps_model import GPSModel  # type: ignore
-                use_submodule = True
-                print("Loaded graphgps from repository submodule")
-            except Exception:
-                print("Failed to load graphgps repo submodule; traceback:")
-                traceback.print_exc()
-
-        if not use_submodule:
-            # Try top-level import as a fallback
-            try:
-                from graphgps.network.gps_model import GPSModel  # type: ignore
-                use_submodule = True
-                print("Loaded graphgps from top-level package")
-            except Exception:
-                print("Top-level import of graphgps failed; will use lightweight fallback")
-                # Print traceback for diagnostic purposes
-                traceback.print_exc()
+        device_arg = str(device)
     except Exception:
-        # Any unexpected error; ensure we fallback to lightweight implementation
-        try:
-            import traceback
-            traceback.print_exc()
-        except Exception:
-            pass
-        use_submodule = False
+        device_arg = device
 
-    if not use_submodule:
-        # Fall back to lightweight builder in benchmarks/graphgps.py
-        try:
-            print("Using lightweight GraphGPS (fallback)")
-            from graphgps import build_graphgps as light_build  # type: ignore
-            return light_build(args, device)
-        except Exception:
-            raise
+    repo_root = Path(__file__).resolve().parents[1]
+    submodule_path = repo_root / "submodules" / "graphgps"
 
-    # Instantiate submodule GPSModel (simple instantiation compatible with our batches)
-    # Honor explicit opt-out flag if present
-    use_flag = getattr(args, 'use_submodule', None)
-    if use_flag is not None and not bool(use_flag):
-        print("use_submodule explicitly disabled in config; falling back to lightweight GraphGPS")
-        try:
-            from graphgps import build_graphgps as light_build  # type: ignore
-            return light_build(args, device)
-        except Exception:
-            raise
+    # Ensure local `benchmarks/` modules (e.g. `mpnn.py`) are importable
+    benchmarks_dir = repo_root / "benchmarks"
+    if str(benchmarks_dir) not in sys.path:
+        sys.path.insert(0, str(benchmarks_dir))
 
-    # Map model_args into GraphGym cfg if available so the submodule model
-    # matches requested hyperparameters (hidden dim, n_layers, n_heads, etc.).
+    # Try to ensure the repo submodule is importable by adding it to sys.path
+    if submodule_path.exists():
+        sp = str(submodule_path)
+        if sp not in sys.path:
+            sys.path.insert(0, sp)
+
+    # Try importing a build_graphgps callable from the installed/submodule
     try:
-        from torch_geometric.graphgym.config import cfg as gym_cfg
+        pkg = importlib.import_module("graphgps")
+        if hasattr(pkg, "build_graphgps"):
+            return getattr(pkg, "build_graphgps")(args, device_arg)
     except Exception:
-        gym_cfg = None
+        # ignore and fall through to fallback loader
+        pass
 
-    # If we found a gym_cfg, try to auto-merge a sensible default YAML from
-    # the graphgps submodule so the submodule has a full config to read.
-    if gym_cfg is not None:
-        try:
-            repo_root = Path(__file__).resolve().parents[1]
-            cfg_candidates = [
-                repo_root / "submodules" / "graphgps" / "tests" / "configs" / "graph" / "zinc-GPS-small.yaml",
-                repo_root / "submodules" / "graphgps" / "tests" / "configs" / "graph" / "zinc-GPS.yaml",
-            ]
-            # Fallback: any yaml file under tests/configs/graph
-            if not any(p.exists() for p in cfg_candidates):
-                graph_cfg_dir = repo_root / "submodules" / "graphgps" / "tests" / "configs" / "graph"
-                if graph_cfg_dir.exists():
-                    first = next(graph_cfg_dir.glob("*.yaml"), None)
-                    if first is not None:
-                        cfg_candidates.append(first)
-
-            for cand in cfg_candidates:
-                try:
-                    if cand.exists():
-                        try:
-                            gym_cfg.merge_from_file(str(cand))
-                            print(f"Loaded GraphGPS config from: {cand}")
-                        except Exception as e:
-                            print(f"Failed to merge GraphGPS config {cand}: {e}")
-                        break
-                except Exception:
-                    continue
-        except Exception:
-            pass
-
-    if gym_cfg is not None:
-        # Ensure `gym_cfg` has the expected subnodes used by the
-        # submodule. Use yacs' CfgNode so we don't violate type
-        # expectations; only populate the minimal fields required by
-        # `GPSModel` to avoid AttributeError on access.
-        try:
-            try:
-                from yacs.config import CfgNode as CN
-            except Exception:
-                CN = None
-
-            # Create subnodes if they are missing and we have CN available
-            if CN is not None:
-                if not hasattr(gym_cfg, 'gnn') or getattr(gym_cfg, 'gnn') is None:
-                    gym_cfg.gnn = CN()
-                if not hasattr(gym_cfg, 'gt') or getattr(gym_cfg, 'gt') is None:
-                    gym_cfg.gt = CN()
-                if not hasattr(gym_cfg, 'dataset') or getattr(gym_cfg, 'dataset') is None:
-                    gym_cfg.dataset = CN()
-
-            # Map common keys into the cfg (create keys if missing)
-            hid = getattr(args, 'hidden_dim', None) or getattr(args, 'd_model', None)
-            if hid is not None:
-                try:
-                    gym_cfg.gnn.dim_inner = int(hid)
-                except Exception:
-                    pass
-                try:
-                    gym_cfg.gt.dim_hidden = int(hid)
-                except Exception:
-                    pass
-
-            nl = getattr(args, 'n_layers', None) or getattr(args, 'num_layers', None)
-            if nl is not None:
-                try:
-                    gym_cfg.gt.layers = int(nl)
-                except Exception:
-                    pass
-
-            nh = getattr(args, 'n_heads', None)
-            if nh is not None:
-                try:
-                    gym_cfg.gt.n_heads = int(nh)
-                except Exception:
-                    pass
-
-            lt = getattr(args, 'gt_layer_type', None) or getattr(args, 'layer_type', None)
-            if lt is not None:
-                try:
-                    gym_cfg.gt.layer_type = lt
-                except Exception:
-                    pass
-
-            pre_mp = getattr(args, 'pre_mp', None)
-            if pre_mp is not None:
-                try:
-                    gym_cfg.gnn.layers_pre_mp = int(pre_mp)
-                except Exception:
-                    pass
-
-            # Print a short summary of the applied cfg for user visibility
-            try:
-                summary = []
-                if hasattr(gym_cfg, 'gnn') and getattr(gym_cfg, 'gnn') is not None:
-                    summary.append(f"gnn.dim_inner={getattr(gym_cfg.gnn, 'dim_inner', None)}")
-                if hasattr(gym_cfg, 'gt') and getattr(gym_cfg, 'gt') is not None:
-                    summary.append(f"gt.layers={getattr(gym_cfg.gt, 'layers', None)}")
-                    summary.append(f"gt.n_heads={getattr(gym_cfg.gt, 'n_heads', None)}")
-                    summary.append(f"gt.layer_type={getattr(gym_cfg.gt, 'layer_type', None)}")
-                print(f"GraphGym cfg mapping: {' ,'.join(summary)}")
-            except Exception:
-                pass
-        except Exception:
-            # If anything goes wrong while mapping into the yacs cfg,
-            # leave gym_cfg unchanged and continue with submodule defaults.
-            pass
-
-    print("Using submodule GraphGPS implementation")
-    # Instantiate GPSModel with an input embedding size that matches the
-    # configured inner dimension when available. The submodule expects
-    # `cfg.gnn.dim_inner == cfg.gt.dim_hidden == dim_in` so prefer the
-    # mapped `gym_cfg.gnn.dim_inner` value when present.
+    # Try importing a top-level module `graphgps` (if available on PYTHONPATH)
     try:
-        # Populate a few additional defaults the submodule expects so
-        # attribute access won't raise `AttributeError`. These are safe
-        # defaults for small/debug runs and match typical graphgps configs.
-        try:
-            if not hasattr(gym_cfg, 'dataset') or getattr(gym_cfg, 'dataset') is None:
-                from yacs.config import CfgNode as CN
-                gym_cfg.dataset = CN()
-        except Exception:
-            pass
-
-        try:
-            # posenc equivstable lapPE flag
-            if not hasattr(gym_cfg, 'posenc_EquivStableLapPE') or getattr(gym_cfg, 'posenc_EquivStableLapPE') is None:
-                from yacs.config import CfgNode as CN
-                gym_cfg.posenc_EquivStableLapPE = CN()
-                gym_cfg.posenc_EquivStableLapPE.enable = False
-        except Exception:
-            pass
-
-        # sensible gt defaults
-        try:
-            if getattr(gym_cfg.gt, 'layer_type', None) is None:
-                gym_cfg.gt.layer_type = 'GINE+Transformer'
-        except Exception:
-            try:
-                gym_cfg.gt.layer_type = 'GINE+Transformer'
-            except Exception:
-                pass
-
-        try:
-            if getattr(gym_cfg.gt, 'n_heads', None) is None:
-                gym_cfg.gt.n_heads = int(getattr(args, 'n_heads', 1))
-        except Exception:
-            pass
-
-        try:
-            if getattr(gym_cfg.gt, 'layers', None) is None:
-                gym_cfg.gt.layers = int(getattr(args, 'n_layers', 1))
-        except Exception:
-            pass
-
-        try:
-            if getattr(gym_cfg.gnn, 'layers_pre_mp', None) is None:
-                gym_cfg.gnn.layers_pre_mp = 0
-        except Exception:
-            pass
-
-        try:
-            if getattr(gym_cfg.gnn, 'act', None) is None:
-                gym_cfg.gnn.act = 'relu'
-        except Exception:
-            pass
-
-        try:
-            if getattr(gym_cfg.gt, 'dropout', None) is None:
-                gym_cfg.gt.dropout = 0.0
-        except Exception:
-            pass
-
-        try:
-            if getattr(gym_cfg.gt, 'attn_dropout', None) is None:
-                gym_cfg.gt.attn_dropout = 0.0
-        except Exception:
-            pass
-
-        try:
-            if getattr(gym_cfg.gt, 'layer_norm', None) is None:
-                gym_cfg.gt.layer_norm = False
-        except Exception:
-            pass
-
-        try:
-            if getattr(gym_cfg.gt, 'batch_norm', None) is None:
-                gym_cfg.gt.batch_norm = False
-        except Exception:
-            pass
-
-        try:
-            if getattr(gym_cfg, 'train', None) is None:
-                from yacs.config import CfgNode as CN
-                gym_cfg.train = CN()
-                gym_cfg.train.mode = ''
-            elif getattr(gym_cfg.train, 'mode', None) is None:
-                gym_cfg.train.mode = ''
-        except Exception:
-            pass
-
-        try:
-            if getattr(gym_cfg.gnn, 'head', None) is None:
-                gym_cfg.gnn.head = 'san_graph'
-        except Exception:
-            pass
-
-        # choose dim_in_for_model equal to configured inner dim when available
-        dim_in_for_model = int(getattr(gym_cfg.gnn, 'dim_inner', 1) or 1)
+        pkg = importlib.import_module("graphgps")
+        if hasattr(pkg, "build_graphgps"):
+            return getattr(pkg, "build_graphgps")(args, device_arg)
     except Exception:
-        dim_in_for_model = 1
-    model = GPSModel(dim_in=dim_in_for_model, dim_out=1).to(device)
+        pass
 
-    class SubmoduleTrainer:
-        def __init__(self, model, lr=1e-3, device="cpu", task_type="regression", loss: str | None = None):
-            self.model = model
-            self.device = torch.device(device)
-            self.model.to(self.device)
-            self.opt = torch.optim.Adam(self.model.parameters(), lr=lr)
-            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.opt, T_max=100)
-            self.task_type = task_type
-            loss_name = (loss or "").lower() if loss is not None else None
-            if loss_name in ("bce", "bcewithlogits", "bce_with_logits"):
-                self.loss_fn = nn.BCEWithLogitsLoss()
-            elif loss_name in ("mse", "mse_loss"):
-                self.loss_fn = nn.MSELoss()
-            elif loss_name in ("mae", "l1", "l1loss"):
-                self.loss_fn = nn.L1Loss()
-            elif loss_name in ("rmse",):
-                def _rmse(pred, target):
-                    mse = nn.MSELoss()(pred, target)
-                    return torch.sqrt(mse + 1e-8)
-                self.loss_fn = _rmse
-            else:
-                self.loss_fn = nn.BCEWithLogitsLoss() if task_type == "classification" else nn.MSELoss()
-
-        def train_epoch(self, loader: DataLoader) -> float:
-            self.model.train()
-            total = 0.0
-            n = 0
-            for batch in loader:
-                batch = batch.to(self.device)
-                pred = self.model(batch)
-                label = batch.y.view(-1, 1)
-                loss = self.loss_fn(pred, label)
-                self.opt.zero_grad()
-                if isinstance(loss, torch.Tensor):
-                    loss.backward()
-                else:
-                    torch.tensor(float(loss), requires_grad=True).backward()
-                self.opt.step()
-                total += loss.item() if isinstance(loss, torch.Tensor) else float(loss)
-                n += 1
-            return total / n if n > 0 else 0.0
-
-        @torch.no_grad()
-        def evaluate(self, loader: DataLoader) -> Dict[str, float]:
-            self.model.eval()
-            total = 0.0
-            total_mae = 0.0
-            correct = 0
-            samples = 0
-            n = 0
-            for batch in loader:
-                batch = batch.to(self.device)
-                pred = self.model(batch)
-                label = batch.y.view(-1, 1)
-                loss = self.loss_fn(pred, label)
-                total += loss.item() if isinstance(loss, torch.Tensor) else float(loss)
-                n += 1
-                if self.task_type == "classification":
-                    p = (torch.sigmoid(pred) > 0.5).float()
-                    correct += (p == label).sum().item()
-                    samples += label.size(0)
-                else:
-                    total_mae += torch.mean(torch.abs(pred - label)).item()
-                    eval_metrics = getattr(self, 'eval_metrics', None) or []
-                    if 'accuracy' in [m.lower() for m in (eval_metrics or [])]:
-                        pred_round = torch.round(pred).to(torch.int64)
-                        label_round = torch.round(label).to(torch.int64)
-                        correct += (pred_round == label_round).sum().item()
-                        samples += label.size(0)
-            metrics = {"loss": total / n if n > 0 else float('nan')}
-            if self.task_type == "classification":
-                metrics["accuracy"] = correct / samples if samples > 0 else float('nan')
-            else:
-                metrics["mae"] = total_mae / n if n > 0 else float('nan')
-                eval_metrics = getattr(self, 'eval_metrics', None) or []
-                if 'accuracy' in [m.lower() for m in (eval_metrics or [])]:
-                    metrics["accuracy"] = correct / samples if samples > 0 else float('nan')
-            return metrics
-
-    task_type = "classification" if args.task in ["cycle_check"] else "regression"
-    trainer = SubmoduleTrainer(model, lr=getattr(args, 'learning_rate', 1e-3), device=device, task_type=task_type, loss=getattr(args, 'loss', None))
+    # Finally, fall back to the lightweight implementation bundled under
+    # `benchmarks/graphgps.py`.
     try:
-        trainer.eval_metrics = getattr(args, 'eval_metrics', None)
+        # First try a normal import relative to this package
+        mod = importlib.import_module("benchmarks.graphgps")
+        if hasattr(mod, "build_graphgps"):
+            return mod.build_graphgps(args, device_arg)
     except Exception:
-        trainer.eval_metrics = None
-
-    return {
-        "train_loader": train_loader,
-        "valid_loader": valid_loader,
-        "test_loader": test_loader,
-        "trainer": trainer,
-        "task_type": task_type,
-    }
+        # Last-resort: load by file path
+        try:
+            fallback = Path(__file__).resolve().parent / "graphgps.py"
+            spec = importlib.util.spec_from_file_location("benchmarks_graphgps_fallback", str(fallback))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod.build_graphgps(args, device_arg)
+        except Exception as e:
+            raise ImportError("Could not import any GraphGPS builder (submodule or fallback).\n"
+                              f"Last error: {e}")
