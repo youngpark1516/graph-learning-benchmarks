@@ -6,7 +6,7 @@ global:
   max_samples_valid: 200
   max_samples_test: 200
   loss: cross_entropy
-  eval_metrics: [accuracy]
+  eval_metrics: [accuracy, mae]
 
 mpnn:
   hidden_dim: 64

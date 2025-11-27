@@ -1,12 +1,3 @@
-"""Clean lightweight GraphGPS-like baseline for graph-token data.
-
-This file provides:
-- `build_graphgps(args, device)` to construct DataLoaders and a Trainer
-- `SimpleGPS` model based on TransformerConv + global pooling
-- A CLI that logs to Weights & Biases (wandb)
-
-Keep this file runnable and minimal so it can be imported by `run_benchmarks.py`.
-"""
 
 from pathlib import Path
 import json
