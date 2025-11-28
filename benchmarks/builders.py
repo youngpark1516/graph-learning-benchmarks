@@ -10,56 +10,71 @@ from types import SimpleNamespace
 
 def build_mpnn(args, device):
     # Import inside function to avoid heavy imports at module-import time
-    from mpnn import GraphTaskDataset, GIN, GraphMPNNTrainer, collate_fn
+    from mpnn import GIN, GraphMPNNTrainer
+    from unified_dataset import PyGGraphDataset
+    from torch_geometric.data import Batch
+    
+    def collate_fn(batch):
+        """Collate function for PyG Data objects that adds labels."""
+        data_list = []
+        for item in batch:
+            data, label = item
+            data.y = label.unsqueeze(0) if label.dim() == 0 else label
+            data_list.append(data)
+        return Batch.from_data_list(data_list)
 
-    # Allow `args.algorithm` to be a list/tuple to form a union of datasets
-    def _maybe_concat(fn, split, *extra_args, **kwargs):
-        algo = args.algorithm
-        if isinstance(algo, (list, tuple)):
-            ds_list = [fn(args.data_dir, args.task, a, split, *extra_args, **kwargs) for a in algo]
-            concat = ConcatDataset(ds_list)
-            # propagate simple attributes (vocab) from first dataset if present
-            first = ds_list[0] if len(ds_list) > 0 else None
-            if first is not None:
-                for attr in ('token2idx', 'idx2token', 'vocab_size'):
-                    if hasattr(first, attr):
-                        val = getattr(first, attr)
-                        setattr(concat, attr, val)
-                        # also propagate into each inner dataset so their
-                        # __getitem__ uses the shared vocabulary
-                        for ds in ds_list:
-                            try:
-                                setattr(ds, attr, val)
-                            except Exception:
-                                pass
-            return concat
-        else:
-            return fn(args.data_dir, args.task, algo, split, *extra_args, **kwargs)
-
-    train_dataset = _maybe_concat(GraphTaskDataset, "train")
-    valid_dataset = _maybe_concat(GraphTaskDataset, "valid")
-    test_dataset = _maybe_concat(GraphTaskDataset, "test")
+    # Create datasets using unified loader
+    train_dataset = PyGGraphDataset(
+        data_path=args.data_dir,
+        split="train",
+        task=args.task,
+        algorithm=args.algorithm if isinstance(args.algorithm, str) else args.algorithm[0],
+        add_query_features=True
+    )
+    valid_dataset = PyGGraphDataset(
+        data_path=args.data_dir,
+        split="valid",
+        task=args.task,
+        algorithm=args.algorithm if isinstance(args.algorithm, str) else args.algorithm[0],
+        add_query_features=True
+    )
+    test_dataset = PyGGraphDataset(
+        data_path=args.data_dir,
+        split="test",
+        task=args.task,
+        algorithm=args.algorithm if isinstance(args.algorithm, str) else args.algorithm[0],
+        add_query_features=True
+    )
 
     # Optionally limit dataset sizes via args (set in model config or CLI overrides)
     try:
         if getattr(args, 'max_samples_train', None) and args.max_samples_train > 0:
             n = min(len(train_dataset), int(args.max_samples_train))
             train_dataset = Subset(train_dataset, list(range(n)))
+            print(f"Limited train dataset to {n} samples")
         if getattr(args, 'max_samples_valid', None) and args.max_samples_valid > 0:
             n = min(len(valid_dataset), int(args.max_samples_valid))
             valid_dataset = Subset(valid_dataset, list(range(n)))
+            print(f"Limited valid dataset to {n} samples")
         if getattr(args, 'max_samples_test', None) and args.max_samples_test > 0:
             n = min(len(test_dataset), int(args.max_samples_test))
             test_dataset = Subset(test_dataset, list(range(n)))
-    except Exception:
-        # Keep original datasets on any error
-        pass
+            print(f"Limited test dataset to {n} samples")
+    except Exception as e:
+        print(f"Warning: Could not limit dataset sizes: {e}")
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
     valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
 
-    model = GIN(in_features=1, hidden_dim=args.hidden_dim, num_layers=args.num_layers, out_features=1, dropout=0.5)
+    # Determine input features based on task
+    # shortest_path adds 2 query encoding features (is_source, is_target) to degree
+    if "shortest_path" in args.task.lower():
+        in_features = 3
+    else:
+        in_features = 1
+    
+    model = GIN(in_features=in_features, hidden_dim=args.hidden_dim, num_layers=args.num_layers, out_features=1, dropout=0.5)
     task_type = "classification" if args.task in ["cycle_check"] else "regression"
     trainer = GraphMPNNTrainer(
         model,
@@ -87,26 +102,50 @@ def build_mpnn(args, device):
 def build_transformer(args, device, which):
     # Lazy import to avoid heavy module loads during import-time checks
     if which == "graph_transformer":
-        from graph_transformer import GraphDataset, GraphTransformer as Transformer
+        from graph_transformer import GraphTransformer as Transformer
     else:
-        from autograph_transformer import GraphDataset as AGDataset, GraphTransformer as AGTransformer
-        GraphDataset = AGDataset
+        from autograph_transformer import GraphTransformer as AGTransformer
         Transformer = AGTransformer
+    
+    # Use unified tokenized dataset loader
+    from unified_dataset import TokenizedGraphDataset
+
+    def transformer_collate_fn(batch):
+        """Collate function for transformer datasets - converts tuples to dicts."""
+        input_ids_list = []
+        labels_list = []
+        
+        for input_ids, label in batch:
+            input_ids_list.append(input_ids)
+            labels_list.append(label)
+        
+        input_ids_batch = torch.stack(input_ids_list)
+        labels_batch = torch.stack(labels_list)
+        
+        # Create attention mask (1 for real tokens, 0 for padding)
+        # Assuming padding token idx is 0
+        attention_mask = (input_ids_batch != 0).long()
+        
+        return {
+            "input_ids": input_ids_batch,
+            "attention_mask": attention_mask,
+            "label": labels_batch,
+        }
 
     # Forward sampling args so datasets can sample `n_samples_per_file` per JSON
-    def _maybe_concat_graphdataset(split):
+    def _maybe_concat_tokenized_dataset(split):
         algo = args.algorithm
         common_kwargs = dict(
-            max_seq_length=args.max_seq_length,
-            n_samples_per_file=getattr(args, 'n_samples_per_file', -1),
-            sampling_seed=getattr(args, 'sampling_seed', None),
+            split=split,
+            task=args.task,
+            max_seq_len=getattr(args, 'max_seq_length', 512),
         )
         if isinstance(algo, (list, tuple)):
-            ds_list = [GraphDataset(args.data_dir, args.task, a, split, **common_kwargs) for a in algo]
+            ds_list = [TokenizedGraphDataset(args.data_dir, algorithm=a, **common_kwargs) for a in algo]
             concat = ConcatDataset(ds_list)
             first = ds_list[0] if len(ds_list) > 0 else None
             if first is not None:
-                for attr in ('token2idx', 'idx2token', 'vocab_size'):
+                for attr in ('token2idx', 'idx2token', 'vocab_size', 'label_vocab'):
                     if hasattr(first, attr):
                         val = getattr(first, attr)
                         setattr(concat, attr, val)
@@ -117,95 +156,80 @@ def build_transformer(args, device, which):
                                 pass
             return concat
         else:
-            return GraphDataset(args.data_dir, args.task, algo, split, **common_kwargs)
+            return TokenizedGraphDataset(args.data_dir, algorithm=algo, **common_kwargs)
 
-    train_dataset = _maybe_concat_graphdataset("train")
-    valid_dataset = _maybe_concat_graphdataset("valid")
-    test_dataset = _maybe_concat_graphdataset("test")
+    train_dataset = _maybe_concat_tokenized_dataset("train")
+    valid_dataset = _maybe_concat_tokenized_dataset("valid")
+    test_dataset = _maybe_concat_tokenized_dataset("test")
+    
+    # Share vocabulary across splits
+    try:
+        if hasattr(train_dataset, 'token2idx'):
+            # Extract base dataset if wrapped in Subset/Concat
+            def _base(ds):
+                if isinstance(ds, Subset):
+                    return ds.dataset
+                if isinstance(ds, ConcatDataset):
+                    return ds.datasets[0] if len(ds.datasets) > 0 else ds
+                return ds
+            
+            base_train = _base(train_dataset)
+            base_valid = _base(valid_dataset)
+            base_test = _base(test_dataset)
+            
+            train_vocab = base_train.token2idx
+            train_labels = base_train.label_vocab if hasattr(base_train, 'label_vocab') else None
+            
+            # Propagate to valid/test
+            if hasattr(base_valid, 'set_vocab'):
+                base_valid.set_vocab(train_vocab, train_labels)
+            else:
+                base_valid.token2idx = train_vocab
+                if train_labels:
+                    base_valid.label_vocab = train_labels
+            
+            if hasattr(base_test, 'set_vocab'):
+                base_test.set_vocab(train_vocab, train_labels)
+            else:
+                base_test.token2idx = train_vocab
+                if train_labels:
+                    base_test.label_vocab = train_labels
+    except Exception as e:
+        print(f"Warning: Could not share vocabulary across splits: {e}")
 
     # Optionally limit dataset sizes via args (set in model config or CLI overrides)
     try:
         if getattr(args, 'max_samples_train', None) and args.max_samples_train > 0:
             n = min(len(train_dataset), int(args.max_samples_train))
             train_dataset = Subset(train_dataset, list(range(n)))
+            print(f"Limited train dataset to {n} samples")
         if getattr(args, 'max_samples_valid', None) and args.max_samples_valid > 0:
             n = min(len(valid_dataset), int(args.max_samples_valid))
             valid_dataset = Subset(valid_dataset, list(range(n)))
+            print(f"Limited valid dataset to {n} samples")
         if getattr(args, 'max_samples_test', None) and args.max_samples_test > 0:
             n = min(len(test_dataset), int(args.max_samples_test))
             test_dataset = Subset(test_dataset, list(range(n)))
-    except Exception:
-        # Keep original datasets on any error
-        pass
+            print(f"Limited test dataset to {n} samples")
+    except Exception as e:
+        print(f"Warning: Could not limit dataset sizes: {e}")
 
-    # Share vocabulary if available. If datasets are wrapped in `Subset`,
-    # extract the underlying base dataset to access `token2idx`/`vocab_size`.
-    def _base(ds):
-        try:
-            from torch.utils.data import Subset as _Subset, ConcatDataset as _Concat
-            if isinstance(ds, _Subset):
-                return ds.dataset
-            if isinstance(ds, _Concat):
-                # return the first underlying dataset for vocab inspection
-                return ds.datasets[0] if len(ds.datasets) > 0 else ds
-            return ds
-        except Exception:
-            return ds
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=transformer_collate_fn)
+    valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=transformer_collate_fn)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=transformer_collate_fn)
 
-    base_train = _base(train_dataset)
-    base_valid = _base(valid_dataset)
-    base_test = _base(test_dataset)
-
-    try:
-        if hasattr(base_train, 'token2idx'):
-            base_valid.token2idx = base_train.token2idx
-            base_valid.idx2token = base_train.idx2token
-            base_valid.vocab_size = base_train.vocab_size
-            # token-id mismatches between training and test time.
-            base_test.token2idx = base_train.token2idx
-            base_test.idx2token = base_train.idx2token
-            base_test.vocab_size = base_train.vocab_size
-    except Exception:
-        pass
-
-    # Ensure the authoritative train vocab is propagated into any inner
-    # datasets that may be wrapped in ConcatDataset or Subset so that
-    # __getitem__ uses the same mapping across splits.
-    def _propagate_to_inner(ds, attr_name, value):
-        try:
-            from torch.utils.data import Subset as _Subset, ConcatDataset as _Concat
-            if isinstance(ds, _Subset):
-                inner = ds.dataset
-            else:
-                inner = ds
-
-            if isinstance(inner, _Concat):
-                for sub in inner.datasets:
-                    try:
-                        setattr(sub, attr_name, value)
-                    except Exception:
-                        pass
-            else:
-                try:
-                    setattr(inner, attr_name, value)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    if hasattr(base_train, 'token2idx'):
-        for attr in ('token2idx', 'idx2token', 'vocab_size'):
-            val = getattr(base_train, attr)
-            _propagate_to_inner(train_dataset, attr, val)
-            _propagate_to_inner(valid_dataset, attr, val)
-            _propagate_to_inner(test_dataset, attr, val)
-
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
-
-    # Ensure we pass the underlying dataset's vocab_size (handle Subset wrappers).
-    vocab_size = getattr(base_train, 'vocab_size', None)
+    # Get vocabulary size from dataset
+    vocab_size = None
+    if hasattr(train_dataset, 'token2idx'):
+        vocab_size = len(train_dataset.token2idx)
+    elif isinstance(train_dataset, Subset):
+        base = train_dataset.dataset
+        if hasattr(base, 'token2idx'):
+            vocab_size = len(base.token2idx)
+    
+    if vocab_size is None:
+        vocab_size = 1000  # fallback
+    
     model = Transformer(vocab_size=vocab_size, d_model=args.d_model, n_heads=args.n_heads, n_layers=args.n_layers, d_ff=args.d_ff, dropout=args.dropout, max_seq_length=args.max_seq_length).to(device)
 
     return {

@@ -31,7 +31,11 @@ def train_transformer_epoch(model, dataloader, optimizer, device, loss_name: str
 
         logits = model(input_ids, attention_mask)  # (B, S, V)
         lengths = attention_mask.long().sum(dim=1)
-        p_pos = lengths - 1
+        # pick the token position for the predicted answer.
+        # many of our examples end with `<answer> <eos>`, so the answer
+        # token is the second-to-last non-padded token. Clamp to 0
+        # to avoid negative indices for very short sequences.
+        p_pos = (lengths - 2).clamp(min=0)
         bsz = input_ids.size(0)
         logits_at_p = logits[torch.arange(bsz, device=device), p_pos, :]
 
@@ -64,7 +68,8 @@ def eval_transformer_epoch(model, dataloader, device, loss_name: str | None = No
 
         logits = model(input_ids, attention_mask)
         lengths = attention_mask.long().sum(dim=1)
-        p_pos = lengths - 1
+        # see comment in training loop: use second-to-last token as answer
+        p_pos = (lengths - 2).clamp(min=0)
         bsz = input_ids.size(0)
         logits_at_p = logits[torch.arange(bsz, device=device), p_pos, :]
 

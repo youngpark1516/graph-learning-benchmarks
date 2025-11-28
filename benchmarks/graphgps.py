@@ -23,8 +23,9 @@ def build_graphgps(args, device: str):
     Returns:
         dict with keys: train_loader, valid_loader, test_loader, trainer, task_type
     """
-    # Reuse dataset and collate_fn from benchmarks/mpnn.py
-    from mpnn import GraphTaskDataset, collate_fn
+    # Use unified dataset loader
+    from unified_dataset import PyGGraphDataset
+    from torch_geometric.data import Batch
 
     data_dir = args.data_dir
     task = args.task
@@ -40,13 +41,63 @@ def build_graphgps(args, device: str):
     n_heads = getattr(args, "n_heads", 4)
     dropout = getattr(args, "dropout", 0.1)
 
-    train_dataset = GraphTaskDataset(data_dir, task, algorithm, "train")
-    valid_dataset = GraphTaskDataset(data_dir, task, algorithm, "valid")
-    test_dataset = GraphTaskDataset(data_dir, task, algorithm, "test")
+    def collate_fn(batch):
+        """Collate function for PyG Data objects that adds labels."""
+        data_list = []
+        for item in batch:
+            data, label = item
+            data.y = label.unsqueeze(0) if label.dim() == 0 else label
+            data_list.append(data)
+        return Batch.from_data_list(data_list)
+
+    train_dataset = PyGGraphDataset(
+        data_path=data_dir,
+        split="train",
+        task=task,
+        algorithm=algorithm if isinstance(algorithm, str) else algorithm[0],
+        add_query_features=True
+    )
+    valid_dataset = PyGGraphDataset(
+        data_path=data_dir,
+        split="valid",
+        task=task,
+        algorithm=algorithm if isinstance(algorithm, str) else algorithm[0],
+        add_query_features=True
+    )
+    test_dataset = PyGGraphDataset(
+        data_path=data_dir,
+        split="test",
+        task=task,
+        algorithm=algorithm if isinstance(algorithm, str) else algorithm[0],
+        add_query_features=True
+    )
+
+    # Optionally limit dataset sizes
+    from torch.utils.data import Subset
+    try:
+        if getattr(args, 'max_samples_train', None) and args.max_samples_train > 0:
+            n = min(len(train_dataset), int(args.max_samples_train))
+            train_dataset = Subset(train_dataset, list(range(n)))
+            print(f"Limited train dataset to {n} samples")
+        if getattr(args, 'max_samples_valid', None) and args.max_samples_valid > 0:
+            n = min(len(valid_dataset), int(args.max_samples_valid))
+            valid_dataset = Subset(valid_dataset, list(range(n)))
+            print(f"Limited valid dataset to {n} samples")
+        if getattr(args, 'max_samples_test', None) and args.max_samples_test > 0:
+            n = min(len(test_dataset), int(args.max_samples_test))
+            test_dataset = Subset(test_dataset, list(range(n)))
+            print(f"Limited test dataset to {n} samples")
+    except Exception as e:
+        print(f"Warning: Could not limit dataset sizes: {e}")
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
     valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+    
+    print(f"[GraphGPS] DataLoaders created:")
+    print(f"  - Train: {len(train_dataset)} samples")
+    print(f"  - Valid: {len(valid_dataset)} samples")
+    print(f"  - Test: {len(test_dataset)} samples")
 
     class SimpleGPS(nn.Module):
         def __init__(
@@ -121,8 +172,19 @@ def build_graphgps(args, device: str):
 
     mpnn_layers = getattr(args, 'mpnn_layers', None) or getattr(args, 'mpnn_num_layers', None) or 0
     mpnn_hidden = getattr(args, 'mpnn_hidden_dim', None) or hidden_dim
+    # Input features: degree (1) + query encoding (2) for shortest_path
+    in_channels = 3 if "shortest_path" in task.lower() else 1
+    
+    print(f"[GraphGPS] Building model with:")
+    print(f"  - Task: {task}")
+    print(f"  - in_channels: {in_channels}")
+    print(f"  - hidden_dim: {hidden_dim}")
+    print(f"  - n_layers: {n_layers}")
+    print(f"  - n_heads: {n_heads}")
+    print(f"  - mpnn_layers: {mpnn_layers}")
+    
     model = SimpleGPS(
-        in_channels=1,
+        in_channels=in_channels,
         hidden_dim=hidden_dim,
         n_layers=n_layers,
         n_heads=n_heads,
@@ -132,6 +194,11 @@ def build_graphgps(args, device: str):
         mpnn_hidden_dim=mpnn_hidden,
     )
     model = model.to(device)
+    
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"[GraphGPS] Model created with {total_params} total params ({trainable_params} trainable)")
 
     class Trainer:
         def __init__(self, model, lr=1e-3, device="cpu", task_type="regression", loss: str | None = None):

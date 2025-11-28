@@ -64,6 +64,9 @@ def main():
     parser.add_argument("--output_dir", type=str, default="./models")
     parser.add_argument("--model_config", type=str, default=None, help="Path to JSON file with per-model overrides")
     parser.add_argument("--log_model", action="store_true", help="Save best model artifact for each run")
+    parser.add_argument("--max_samples_train", type=int, default=None, help="Limit training dataset size (useful for testing)")
+    parser.add_argument("--max_samples_valid", type=int, default=None, help="Limit validation dataset size")
+    parser.add_argument("--max_samples_test", type=int, default=None, help="Limit test dataset size")
 
     args = parser.parse_args()
     add_repo_path()
@@ -87,6 +90,9 @@ def main():
         "epochs": 10,
         "log_model": False,
         "run_name": None,
+        "max_samples_train": None,
+        "max_samples_valid": None,
+        "max_samples_test": None,
     }
 
     # Auto-discover model config if not explicitly provided. Prefer YAML.
@@ -191,19 +197,6 @@ def main():
                 run_name = f"{model_args.run_name}-{model_name}-{int(time.time())}"
             else:
                 run_name = f"{model_name}-{model_args.task}-{int(time.time())}"
-
-            # Check that the task data exists for at least one algorithm before starting a run
-            data_root = Path(model_args.data_dir) / "tasks_autograph" / model_args.task
-            found = False
-            algo_list = model_args.algorithm if isinstance(model_args.algorithm, (list, tuple)) else [model_args.algorithm]
-            for a in algo_list:
-                train_dir = data_root / a / "train"
-                if train_dir.exists():
-                    found = True
-                    break
-            if not found:
-                print(f"Data not found for task '{model_args.task}' for algorithms {algo_list} under: {data_root}. Skipping model '{model_name}'.")
-                continue
 
             # initialize a separate wandb run per model, grouped together
             wandb.init(project=model_args.project, name=run_name, group=group_id, config=vars(model_args))
