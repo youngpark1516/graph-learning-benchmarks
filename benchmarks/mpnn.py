@@ -55,7 +55,11 @@ class GraphTaskDataset(Dataset):
         """Load samples from JSON files."""
         samples = []
 
-        base = self.data_dir / "tasks_autograph" / self.task
+        # Handle both cases: data_dir as parent of tasks_autograph or as tasks_autograph itself
+        if (self.data_dir / "tasks_autograph").exists():
+            base = self.data_dir / "tasks_autograph" / self.task
+        else:
+            base = self.data_dir / self.task
 
         # If algorithm is a list, collect samples from each algorithm subfolder
         algo_list = self.algorithm if isinstance(self.algorithm, (list, tuple)) else [self.algorithm]

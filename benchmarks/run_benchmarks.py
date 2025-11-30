@@ -67,6 +67,12 @@ def main():
     parser.add_argument("--max_samples_train", type=int, default=None, help="Limit training dataset size (useful for testing)")
     parser.add_argument("--max_samples_valid", type=int, default=None, help="Limit validation dataset size")
     parser.add_argument("--max_samples_test", type=int, default=None, help="Limit test dataset size")
+    
+    # GraphGPS-specific arguments for positional encoding and normalization
+    parser.add_argument("--use_lap_pe", action="store_true", help="Enable Laplacian Positional Encoding for GraphGPS")
+    parser.add_argument("--lap_pe_dim", type=int, default=16, help="Dimension of Laplacian PE (default: 16)")
+    parser.add_argument("--norm_type", type=str, default="batch", choices=["batch", "layer", "graph", "instance", "none"],
+                       help="Normalization type for GraphGPS (default: batch)")
 
     args = parser.parse_args()
     add_repo_path()
@@ -93,6 +99,9 @@ def main():
         "max_samples_train": None,
         "max_samples_valid": None,
         "max_samples_test": None,
+        "use_lap_pe": False,
+        "lap_pe_dim": 16,
+        "norm_type": "batch",
     }
 
     # Auto-discover model config if not explicitly provided. Prefer YAML.

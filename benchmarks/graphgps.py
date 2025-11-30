@@ -2,15 +2,69 @@
 from pathlib import Path
 import json
 import time
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+import numpy as np
+from scipy.sparse import coo_matrix
 
 from torch_geometric.nn import TransformerConv, global_mean_pool, GINConv
+from torch_geometric.nn.norm import LayerNorm, GraphNorm, InstanceNorm
 import wandb
+
+
+def compute_laplacian_pe(edge_index, num_nodes, k=16):
+    """Compute Laplacian Positional Encoding (LapPE).
+    
+    Args:
+        edge_index: Edge indices [2, num_edges]
+        num_nodes: Number of nodes
+        k: Number of eigenvectors to use
+        
+    Returns:
+        Laplacian PE matrix [num_nodes, k]
+    """
+    try:
+        from scipy.sparse.linalg import eigsh
+        
+        # Clamp k to a reasonable value - must be at least 1 and less than num_nodes - 2
+        k = min(k, max(1, num_nodes - 2))
+        
+        # Build adjacency matrix
+        row = edge_index[0].cpu().numpy()
+        col = edge_index[1].cpu().numpy()
+        data = np.ones(len(row))
+        adj = coo_matrix((data, (row, col)), shape=(num_nodes, num_nodes))
+        adj = adj + adj.T  # Make symmetric (undirected)
+        
+        # Compute degree matrix
+        degrees = np.array(adj.sum(axis=1)).flatten()
+        degrees[degrees == 0] = 1  # Avoid division by zero
+        inv_sqrt_deg = np.diag(1.0 / np.sqrt(degrees))
+        
+        # Normalized Laplacian: L = I - D^{-1/2} A D^{-1/2}
+        L = np.eye(num_nodes) - inv_sqrt_deg @ adj.toarray() @ inv_sqrt_deg
+        
+        # Get smallest k eigenvalues and eigenvectors
+        try:
+            if k > 0 and k < num_nodes - 1:
+                eigenvalues, eigenvectors = eigsh(L, k=k, which='SM', maxiter=2000)
+                pe = torch.from_numpy(eigenvectors).float()
+            else:
+                pe = torch.randn(num_nodes, k).float()
+        except Exception:
+            # Fallback: use random encoding if eigendecomposition fails
+            pe = torch.randn(num_nodes, k).float()
+            
+    except Exception as e:
+        # Fallback: random encoding
+        k = max(1, min(k, num_nodes - 1))
+        pe = torch.randn(num_nodes, k).float()
+    
+    return pe
 
 
 def build_graphgps(args, device: str):
@@ -40,6 +94,11 @@ def build_graphgps(args, device: str):
     n_layers = max(1, getattr(args, "num_layers", None) or getattr(args, "n_layers", 3))
     n_heads = getattr(args, "n_heads", 4)
     dropout = getattr(args, "dropout", 0.1)
+    
+    # New PE and normalization options
+    use_lap_pe = getattr(args, "use_lap_pe", False)
+    lap_pe_dim = getattr(args, "lap_pe_dim", 16)
+    norm_type = getattr(args, "norm_type", "batch")  # "batch", "layer", "graph", "instance", "none"
 
     def collate_fn(batch):
         """Collate function for PyG Data objects that adds labels."""
@@ -110,8 +169,15 @@ def build_graphgps(args, device: str):
             dropout: float = 0.1,
             mpnn_layers: int = 0,
             mpnn_hidden_dim: int | None = None,
+            use_lap_pe: bool = False,
+            lap_pe_dim: int = 16,
+            norm_type: str = "batch",
         ):
             super().__init__()
+            self.use_lap_pe = use_lap_pe
+            self.lap_pe_dim = lap_pe_dim
+            self.norm_type = norm_type
+            
             # Optional GIN MPNN front-end
             self.mpnn_layers_count = int(mpnn_layers or 0)
             self.mpnn_hidden_dim = int(mpnn_hidden_dim) if mpnn_hidden_dim is not None else None
@@ -120,11 +186,11 @@ def build_graphgps(args, device: str):
                 mp_h = self.mpnn_hidden_dim or hidden_dim
                 self.mp_input_lin = nn.Linear(in_channels, mp_h)
                 self.mpnn_gins = nn.ModuleList()
-                self.mpnn_bns = nn.ModuleList()
+                self.mpnn_norms = nn.ModuleList()
                 for _ in range(self.mpnn_layers_count):
                     nn_first = nn.Sequential(nn.Linear(mp_h, mp_h), nn.ReLU(), nn.Linear(mp_h, mp_h))
                     self.mpnn_gins.append(GINConv(nn_first))
-                    self.mpnn_bns.append(nn.BatchNorm1d(mp_h))
+                    self.mpnn_norms.append(self._get_norm_layer(mp_h))
                 # project to transformer hidden dim if needed
                 if mp_h != hidden_dim:
                     self.mp_to_tr = nn.Linear(mp_h, hidden_dim)
@@ -133,19 +199,43 @@ def build_graphgps(args, device: str):
             else:
                 self.mp_input_lin = None
                 self.mpnn_gins = None
-                self.mpnn_bns = None
+                self.mpnn_norms = None
                 self.mp_to_tr = None
 
+            # Positional Encoding projection if enabled
+            if self.use_lap_pe:
+                self.pe_lin = nn.Linear(lap_pe_dim, hidden_dim)
+            
             # Transformer input projection (used when no mpnn front-end)
             self.input_lin = nn.Linear(in_channels, hidden_dim) if self.mpnn_layers_count == 0 else None
 
-            # Transformer-style convolutions
+            # Transformer-style convolutions with normalization
             self.convs = nn.ModuleList()
+            self.conv_norms = nn.ModuleList()
             for _ in range(n_layers):
                 self.convs.append(TransformerConv(hidden_dim, max(1, hidden_dim // n_heads), heads=n_heads, dropout=dropout))
+                self.conv_norms.append(self._get_norm_layer(hidden_dim))
 
             self.pool = global_mean_pool
-            self.mlp = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Dropout(dropout), nn.Linear(hidden_dim, out_dim))
+            self.mlp = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim), 
+                nn.ReLU(), 
+                nn.Dropout(dropout), 
+                nn.Linear(hidden_dim, out_dim)
+            )
+
+        def _get_norm_layer(self, dim: int):
+            """Get normalization layer based on norm_type."""
+            if self.norm_type.lower() == "batch":
+                return nn.BatchNorm1d(dim)
+            elif self.norm_type.lower() == "layer":
+                return LayerNorm(dim)
+            elif self.norm_type.lower() == "graph":
+                return GraphNorm(dim)
+            elif self.norm_type.lower() == "instance":
+                return InstanceNorm(dim)
+            else:
+                return nn.Identity()
 
         def forward(self, batch):
             x, edge_index, batch_idx = batch.x, batch.edge_index, batch.batch
@@ -153,19 +243,33 @@ def build_graphgps(args, device: str):
             # If MPNN front-end is configured, run GIN layers first
             if self.mpnn_layers_count > 0:
                 x = self.mp_input_lin(x)
-                for gin, bn in zip(self.mpnn_gins, self.mpnn_bns):
+                for gin, norm in zip(self.mpnn_gins, self.mpnn_norms):
+                    x_in = x
                     x = gin(x, edge_index)
-                    x = bn(x)
+                    x = norm(x)
                     x = F.relu(x)
-                    x = F.dropout(x, p=self.mlp[2].p if len(self.mlp) > 2 and isinstance(self.mlp[2], nn.Dropout) else 0.0, training=self.training)
+                    x = F.dropout(x, p=dropout, training=self.training)
+                    x = x + x_in  # Residual connection
                 if self.mp_to_tr is not None:
                     x = self.mp_to_tr(x)
             else:
                 x = self.input_lin(x)
+            
+            # Add Laplacian PE if enabled
+            if self.use_lap_pe:
+                pe = compute_laplacian_pe(edge_index, batch.num_nodes, k=self.lap_pe_dim).to(x.device)
+                # Only add PE for first batch (avoid dimension mismatch in batched inference)
+                if pe.shape[0] == x.shape[0]:
+                    pe_proj = self.pe_lin(pe)
+                    x = x + pe_proj
 
-            for conv in self.convs:
+            for conv, norm in zip(self.convs, self.conv_norms):
+                x_in = x
                 x = conv(x, edge_index)
+                x = norm(x)
                 x = F.relu(x)
+                x = x + x_in  # Residual connection
+            
             x = self.pool(x, batch_idx)
             out = self.mlp(x)
             return out
@@ -182,6 +286,9 @@ def build_graphgps(args, device: str):
     print(f"  - n_layers: {n_layers}")
     print(f"  - n_heads: {n_heads}")
     print(f"  - mpnn_layers: {mpnn_layers}")
+    print(f"  - use_lap_pe: {use_lap_pe}")
+    print(f"  - lap_pe_dim: {lap_pe_dim if use_lap_pe else 'N/A'}")
+    print(f"  - norm_type: {norm_type}")
     
     model = SimpleGPS(
         in_channels=in_channels,
@@ -192,6 +299,9 @@ def build_graphgps(args, device: str):
         dropout=dropout,
         mpnn_layers=mpnn_layers,
         mpnn_hidden_dim=mpnn_hidden,
+        use_lap_pe=use_lap_pe,
+        lap_pe_dim=lap_pe_dim,
+        norm_type=norm_type,
     )
     model = model.to(device)
     
@@ -333,6 +443,11 @@ def _cli():
     parser.add_argument("--group", type=str, default=None)
     parser.add_argument("--log_model", action="store_true")
     
+    # New PE and normalization arguments
+    parser.add_argument("--use_lap_pe", action="store_true", help="Enable Laplacian Positional Encoding")
+    parser.add_argument("--lap_pe_dim", type=int, default=16, help="Dimension of Laplacian PE")
+    parser.add_argument("--norm_type", type=str, default="batch", choices=["batch", "layer", "graph", "instance", "none"], 
+                       help="Normalization type to use")
 
     args = parser.parse_args()
     out_dir = Path(args.output_dir)

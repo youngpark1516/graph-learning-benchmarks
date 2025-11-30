@@ -43,7 +43,11 @@ class GraphDataset(Dataset):
 
     def _load_samples(self) -> List[dict]:
         """Load all JSON files for the specified task/algorithm/split."""
-        task_dir = self.data_dir / "tasks_autograph" / self.task / self.algorithm / self.split
+        # Handle both cases: data_dir as parent of tasks_autograph or as tasks_autograph itself
+        if (self.data_dir / "tasks_autograph").exists():
+            task_dir = self.data_dir / "tasks_autograph" / self.task / self.algorithm / self.split
+        else:
+            task_dir = self.data_dir / self.task / self.algorithm / self.split
         samples = []
         rng = random.Random(self.sampling_seed) if self.sampling_seed is not None else random
         for json_file in sorted(task_dir.glob("*.json")):
