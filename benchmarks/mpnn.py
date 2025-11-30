@@ -48,13 +48,18 @@ class GraphTaskDataset(Dataset):
         self.samples = self._load_samples()
         self.graphs = []
         self.labels = []
+        self.query_nodes = []  # Store (u, v) pairs for shortest_path
         self._parse_samples()
     
     def _load_samples(self) -> List[dict]:
         """Load samples from JSON files."""
         samples = []
 
-        base = self.data_dir / "tasks_autograph" / self.task
+        # Handle both cases: data_dir as parent of tasks_autograph or as tasks_autograph itself
+        if (self.data_dir / "tasks_autograph").exists():
+            base = self.data_dir / "tasks_autograph" / self.task
+        else:
+            base = self.data_dir / self.task
 
         # If algorithm is a list, collect samples from each algorithm subfolder
         algo_list = self.algorithm if isinstance(self.algorithm, (list, tuple)) else [self.algorithm]
@@ -132,6 +137,25 @@ class GraphTaskDataset(Dataset):
         
         return graph, idx
     
+    def _extract_query_nodes(self, tokens: List[str]) -> Optional[Tuple[int, int]]:
+        """Extract query nodes from tokens for shortest_path task.
+        
+        Format: <q> shortest_distance u v
+        Returns: (u, v) or None if not found
+        """
+        try:
+            q_idx = tokens.index("<q>")
+            if q_idx + 3 < len(tokens) and tokens[q_idx + 1] == "shortest_distance":
+                try:
+                    u = int(tokens[q_idx + 2])
+                    v = int(tokens[q_idx + 3])
+                    return (u, v)
+                except (ValueError, IndexError):
+                    pass
+        except (ValueError, IndexError):
+            pass
+        return None
+    
     def _extract_label(self, tokens: List[str]) -> Optional[float]:
         """Extract label from tokens (numeric or categorical).
         
@@ -167,6 +191,7 @@ class GraphTaskDataset(Dataset):
         """Parse all samples into graphs and labels."""
         failed_count = 0
         success_count = 0
+        inf_skipped = 0
         
         for i, sample in enumerate(self.samples):
             text = sample.get("text", "")
@@ -180,9 +205,27 @@ class GraphTaskDataset(Dataset):
                 graph, idx = self._parse_graph_from_tokens(tokens)
                 label = self._extract_label(tokens)
                 
+                # For shortest_path, skip INF (unreachable) labels
+                if self.task == "shortest_path":
+                    try:
+                        p_idx = tokens.index("<p>")
+                        if p_idx + 1 < len(tokens) and tokens[p_idx + 1].upper() in ["INF", "INFINITY"]:
+                            inf_skipped += 1
+                            continue
+                    except ValueError:
+                        pass
+                
+                query_nodes = None
+                if self.task == "shortest_path":
+                    query_nodes = self._extract_query_nodes(tokens)
+                    if query_nodes is None:
+                        failed_count += 1
+                        continue
+                
                 if graph.number_of_nodes() > 0 and label is not None:
                     self.graphs.append(graph)
                     self.labels.append(label)
+                    self.query_nodes.append(query_nodes)  # None for non-shortest_path tasks
                     success_count += 1
                 else:
                     failed_count += 1
@@ -197,17 +240,38 @@ class GraphTaskDataset(Dataset):
             print(f"  WARNING: Parsed {success_count} samples successfully, {failed_count} failed")
             if len(self.samples) > 0:
                 print(f"  First sample text (first 200 chars): {str(self.samples[0].get('text', ''))[:200]}")
+        
+        if self.task == "shortest_path" and inf_skipped > 0:
+            print(f"  Skipped {inf_skipped} unreachable (INF) samples for shortest_path")
     
-    def _nx_to_pyg(self, graph: nx.Graph) -> Data:
-        """Convert NetworkX graph to PyTorch Geometric Data object."""
+    def _nx_to_pyg(self, graph: nx.Graph, query_nodes: Optional[Tuple[int, int]] = None) -> Data:
+        """Convert NetworkX graph to PyTorch Geometric Data object.
+        
+        Args:
+            graph: NetworkX graph
+            query_nodes: (u, v) tuple for shortest_path task, None otherwise
+        """
         node_features = []
         degree_dict = dict(graph.degree())
-        for node in sorted(graph.nodes()):
+        sorted_nodes = sorted(graph.nodes())
+        
+        for node in sorted_nodes:
             degree = degree_dict.get(node, 0)
-            node_features.append([float(degree)])
+            features = [float(degree)]
+            
+            # Add query encoding for shortest_path task
+            if query_nodes is not None:
+                query_u, query_v = query_nodes
+                is_source = 1.0 if node == query_u else 0.0
+                is_target = 1.0 if node == query_v else 0.0
+                features.extend([is_source, is_target])
+            
+            node_features.append(features)
         
         if len(node_features) == 0:
-            node_features = [[0.0]]
+            # Fallback for empty graphs
+            feature_dim = 3 if query_nodes is not None else 1
+            node_features = [[0.0] * feature_dim]
         
         x = torch.tensor(node_features, dtype=torch.float)
         
@@ -230,7 +294,8 @@ class GraphTaskDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[Data, float]:
         graph = self.graphs[idx]
         label = self.labels[idx]
-        data = self._nx_to_pyg(graph)
+        query_nodes = self.query_nodes[idx] if idx < len(self.query_nodes) else None
+        data = self._nx_to_pyg(graph, query_nodes)
         return data, torch.tensor(label, dtype=torch.float)
 
 
@@ -560,8 +625,10 @@ def main(
         collate_fn=collate_fn,
     )
     
-    in_features = 1
+    # Input features: degree (1) + query encoding (2) for shortest_path
+    in_features = 3 if task == "shortest_path" else 1
     
+    # Only cycle_check is binary classification; shortest_path predicts path length (regression)
     task_type = "classification" if task in ["cycle_check"] else "regression"
     
     model = GIN(
