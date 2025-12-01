@@ -336,6 +336,9 @@ class PyGGraphDataset(UnifiedGraphDataset):
             edge_index = torch.tensor([[], []], dtype=torch.long)
             return Data(x=x, edge_index=edge_index)
         
+        # Create mapping from original node indices to contiguous indices [0, 1, 2, ...]
+        node_to_idx = {node: idx for idx, node in enumerate(nodes)}
+        
         for node in nodes:
             features = [float(graph.degree(node))]
             
@@ -350,11 +353,13 @@ class PyGGraphDataset(UnifiedGraphDataset):
         
         x = torch.tensor(node_features, dtype=torch.float)
         
-        # Build edge index
+        # Build edge index with remapped node indices
         edge_list = []
         for u, v in graph.edges():
-            edge_list.append([u, v])
-            edge_list.append([v, u])  # Undirected graph
+            u_idx = node_to_idx[u]
+            v_idx = node_to_idx[v]
+            edge_list.append([u_idx, v_idx])
+            edge_list.append([v_idx, u_idx])  # Undirected graph
         
         if len(edge_list) == 0:
             edge_index = torch.tensor([[], []], dtype=torch.long)
