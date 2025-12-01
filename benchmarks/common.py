@@ -16,6 +16,8 @@ def _make_standard_log(epoch, model_name, task_type, train_metrics, valid_metric
     included for both train and valid logs (e.g. ['mae','accuracy']). If not
     provided, previous behavior applies: report `accuracy` for
     `classification` tasks and `mae` for regression tasks.
+    
+    Always includes f1_score for classification tasks.
     """
     out = {
         "epoch": epoch + 1,
@@ -30,11 +32,17 @@ def _make_standard_log(epoch, model_name, task_type, train_metrics, valid_metric
             m_lower = m.lower()
             out[f"train_{m_lower}"] = train_metrics.get(m_lower) if train_metrics else None
             out[f"valid_{m_lower}"] = valid_metrics.get(m_lower) if valid_metrics else None
+        # Also always include f1_score for classification tasks
+        if task_type == "classification":
+            out[f"train_f1_score"] = train_metrics.get("f1_score") if train_metrics else None
+            out[f"valid_f1_score"] = valid_metrics.get("f1_score") if valid_metrics else None
         return out
 
     # Backwards compatible defaults when no explicit eval_metrics given
     out["train_accuracy"] = train_metrics.get("accuracy") if (train_metrics and task_type == "classification") else None
     out["valid_accuracy"] = valid_metrics.get("accuracy") if (valid_metrics and task_type == "classification") else None
+    out["train_f1_score"] = train_metrics.get("f1_score") if (train_metrics and task_type == "classification") else None
+    out["valid_f1_score"] = valid_metrics.get("f1_score") if (valid_metrics and task_type == "classification") else None
     out["train_mae"] = train_metrics.get("mae") if (train_metrics and task_type != "classification") else None
     out["valid_mae"] = valid_metrics.get("mae") if (valid_metrics and task_type != "classification") else None
     return out
@@ -45,6 +53,8 @@ def _make_standard_test_log(model_name, task_type, test_metrics, eval_metrics=No
 
     If `eval_metrics` is provided, include those metrics as `test_<metric>`.
     Otherwise preserve the previous behavior based on `task_type`.
+    
+    Always includes f1_score for classification tasks.
     """
     out = {
         "model": model_name,
@@ -54,8 +64,12 @@ def _make_standard_test_log(model_name, task_type, test_metrics, eval_metrics=No
     if eval_metrics:
         for m in eval_metrics:
             out[f"test_{m.lower()}"] = test_metrics.get(m.lower()) if test_metrics else None
+        # Also always include f1_score for classification tasks
+        if task_type == "classification":
+            out[f"test_f1_score"] = test_metrics.get("f1_score") if test_metrics else None
         return out
 
     out["test_accuracy"] = test_metrics.get("accuracy") if (test_metrics and task_type == "classification") else None
+    out["test_f1_score"] = test_metrics.get("f1_score") if (test_metrics and task_type == "classification") else None
     out["test_mae"] = test_metrics.get("mae") if (test_metrics and task_type != "classification") else None
     return out

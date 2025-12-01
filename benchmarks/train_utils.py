@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from sklearn.metrics import f1_score
 
 
 def _make_loss_fn_for_transformer(loss_name: str | None):
@@ -23,6 +24,8 @@ def train_transformer_epoch(model, dataloader, optimizer, device, loss_name: str
     total_loss = 0.0
     total_correct = 0
     total_count = 0
+    all_preds = []
+    all_labels = []
     loss_fn = _make_loss_fn_for_transformer(loss_name)
     for batch in dataloader:
         input_ids = batch["input_ids"].to(device)
@@ -48,10 +51,13 @@ def train_transformer_epoch(model, dataloader, optimizer, device, loss_name: str
         total_correct += (preds == labels).sum().item()
         total_loss += loss.item() * bsz
         total_count += bsz
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
 
     avg_loss = total_loss / total_count if total_count > 0 else float('nan')
     acc = total_correct / total_count if total_count > 0 else float('nan')
-    return avg_loss, acc
+    f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0) if len(all_labels) > 0 else 0.0
+    return avg_loss, acc, f1
 
 
 @torch.no_grad()
@@ -60,6 +66,8 @@ def eval_transformer_epoch(model, dataloader, device, loss_name: str | None = No
     total_loss = 0.0
     total_correct = 0
     total_count = 0
+    all_preds = []
+    all_labels = []
     loss_fn = _make_loss_fn_for_transformer(loss_name)
     for batch in dataloader:
         input_ids = batch["input_ids"].to(device)
@@ -78,7 +86,11 @@ def eval_transformer_epoch(model, dataloader, device, loss_name: str | None = No
         total_correct += (preds == labels).sum().item()
         total_loss += loss.item() * bsz
         total_count += bsz
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
 
     avg_loss = total_loss / total_count if total_count > 0 else float('nan')
     acc = total_correct / total_count if total_count > 0 else float('nan')
-    return avg_loss, acc
+    f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0) if len(all_labels) > 0 else 0.0
+    return avg_loss, acc, f1
+

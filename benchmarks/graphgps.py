@@ -13,6 +13,7 @@ from scipy.sparse import coo_matrix
 
 from torch_geometric.nn import TransformerConv, global_mean_pool, GINConv
 from torch_geometric.nn.norm import LayerNorm, GraphNorm, InstanceNorm
+from sklearn.metrics import f1_score
 import wandb
 
 
@@ -279,9 +280,39 @@ def build_graphgps(args, device: str):
     # Input features: degree (1) + query encoding (2) for shortest_path
     in_channels = 3 if "shortest_path" in task.lower() else 1
     
+    # Determine task type and output dimension
+    task_type = "classification" if task in ["cycle_check", "shortest_path"] or "shortest_path" in task else "regression"
+    
+    # For classification, determine number of classes from training data
+    out_dim = 1
+    if task_type == "classification":
+        try:
+            labels = []
+            base_train = train_dataset.dataset if hasattr(train_dataset, 'dataset') else train_dataset
+            # Sample labels comprehensively - check entire dataset if small, otherwise sample more
+            sample_size = min(len(base_train), 5000)  # Increased from 1000
+            for i in range(sample_size):
+                try:
+                    _, label = base_train[i]
+                    labels.append(int(label))
+                except Exception:
+                    pass
+            if labels:
+                # For distance-based tasks like shortest_path, use max label + 1 as num_classes
+                max_label = max(labels)
+                num_classes = max_label + 1
+                out_dim = max(2, num_classes)
+            else:
+                out_dim = 2
+        except Exception as e:
+            print(f"Warning: Could not determine number of classes: {e}")
+            out_dim = 2
+    
     print(f"[GraphGPS] Building model with:")
     print(f"  - Task: {task}")
+    print(f"  - task_type: {task_type}")
     print(f"  - in_channels: {in_channels}")
+    print(f"  - out_dim: {out_dim}")
     print(f"  - hidden_dim: {hidden_dim}")
     print(f"  - n_layers: {n_layers}")
     print(f"  - n_heads: {n_heads}")
@@ -295,7 +326,7 @@ def build_graphgps(args, device: str):
         hidden_dim=hidden_dim,
         n_layers=n_layers,
         n_heads=n_heads,
-        out_dim=1,
+        out_dim=out_dim,
         dropout=dropout,
         mpnn_layers=mpnn_layers,
         mpnn_hidden_dim=mpnn_hidden,
@@ -311,13 +342,14 @@ def build_graphgps(args, device: str):
     print(f"[GraphGPS] Model created with {total_params} total params ({trainable_params} trainable)")
 
     class Trainer:
-        def __init__(self, model, lr=1e-3, device="cpu", task_type="regression", loss: str | None = None):
+        def __init__(self, model, lr=1e-3, device="cpu", task_type="regression", loss: str | None = None, task_name: str | None = None):
             self.model = model
             self.device = torch.device(device)
             self.model.to(self.device)
             self.opt = torch.optim.Adam(self.model.parameters(), lr=lr)
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.opt, T_max=100)
             self.task_type = task_type
+            self.task_name = task_name or ""
 
             # Configure loss function based on provided loss name or sensible defaults
             loss_name = (loss or "").lower() if loss is not None else None
@@ -335,9 +367,17 @@ def build_graphgps(args, device: str):
 
                     self.loss_fn = _rmse
                 else:
-                    self.loss_fn = nn.BCEWithLogitsLoss() if task_type == "classification" else nn.MSELoss()
+                    self.loss_fn = self._get_default_loss_fn()
             else:
-                self.loss_fn = nn.BCEWithLogitsLoss() if task_type == "classification" else nn.MSELoss()
+                self.loss_fn = self._get_default_loss_fn()
+        
+        def _get_default_loss_fn(self):
+            """Get default loss function based on task type and task name."""
+            # Classification tasks (including shortest_path) use cross-entropy
+            if self.task_type == "classification":
+                return nn.CrossEntropyLoss()
+            # Regression tasks use MSE
+            return nn.MSELoss()
 
         def train_epoch(self, loader: DataLoader) -> float:
             self.model.train()
@@ -346,8 +386,15 @@ def build_graphgps(args, device: str):
             for batch in loader:
                 batch = batch.to(self.device)
                 pred = self.model(batch)
-                label = batch.y.view(-1, 1)
-                loss = self.loss_fn(pred, label)
+                label = batch.y
+                
+                # Handle label shape for loss computation
+                if self.task_type == "classification":
+                    label_for_loss = label.long()
+                else:
+                    label_for_loss = label.view(-1, 1)
+                
+                loss = self.loss_fn(pred, label_for_loss)
                 self.opt.zero_grad()
                 loss.backward()
                 self.opt.step()
@@ -363,19 +410,40 @@ def build_graphgps(args, device: str):
             correct = 0
             samples = 0
             n = 0
+            
+            # For F1 score computation in classification
+            all_preds = []
+            all_labels = []
+            
             for batch in loader:
                 batch = batch.to(self.device)
                 pred = self.model(batch)
-                label = batch.y.view(-1, 1)
-                loss = self.loss_fn(pred, label)
+                label = batch.y
+                
+                # Handle label shape for loss computation
+                if self.task_type == "classification":
+                    label_for_loss = label.long()
+                else:
+                    label_for_loss = label.view(-1, 1)
+                
+                loss = self.loss_fn(pred, label_for_loss)
                 total += loss.item()
                 n += 1
                 if self.task_type == "classification":
-                    p = (torch.sigmoid(pred) > 0.5).float()
-                    correct += (p == label).sum().item()
+                    # Use argmax for multi-class classification (including shortest_path)
+                    if pred.dim() > 1 and pred.size(1) > 1:
+                        # Multi-class: pred has shape (batch_size, num_classes)
+                        pred_classes = pred.argmax(dim=1)
+                    else:
+                        # Binary or single output: round the predictions
+                        pred_classes = torch.round(pred).to(torch.int64).squeeze(-1)
+                    
+                    all_preds.extend(pred_classes.cpu().numpy().flatten().tolist())
+                    all_labels.extend(label.cpu().numpy().flatten().tolist())
+                    correct += (pred_classes == label.long()).sum().item()
                     samples += label.size(0)
                 else:
-                        total_mae += torch.mean(torch.abs(pred - label)).item()
+                        total_mae += torch.mean(torch.abs(pred - label.view(-1, 1))).item()
                         # If caller requested accuracy for regression tasks, compute it
                         eval_metrics = getattr(self, 'eval_metrics', None) or []
                         if 'accuracy' in [m.lower() for m in (eval_metrics or [])]:
@@ -387,6 +455,11 @@ def build_graphgps(args, device: str):
             metrics = {"loss": total / n if n > 0 else float('nan')}
             if self.task_type == "classification":
                 metrics["accuracy"] = correct / samples if samples > 0 else float('nan')
+                # Compute F1 score for classification tasks
+                if all_labels:
+                    metrics["f1_score"] = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
+                else:
+                    metrics["f1_score"] = 0.0
             else:
                 metrics["mae"] = total_mae / n if n > 0 else float('nan')
                 # If accuracy was requested for regression tasks, include it
@@ -401,13 +474,14 @@ def build_graphgps(args, device: str):
         def load_checkpoint(self, path: str):
             self.model.load_state_dict(torch.load(path, map_location=self.device))
 
-    task_type = "classification" if task in ["cycle_check"] else "regression"
+    task_type = "classification" if task in ["cycle_check", "shortest_path"] or "shortest_path" in task else "regression"
     trainer = Trainer(
         model,
         lr=getattr(args, "learning_rate", 1e-3),
         device=device,
         task_type=task_type,
         loss=getattr(args, "loss", None),
+        task_name=task,
     )
     # Propagate eval_metrics from args so Trainer can compute optional metrics
     try:

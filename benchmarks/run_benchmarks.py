@@ -320,13 +320,13 @@ def main():
                 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, model_args.epochs))
 
                 for epoch in range(model_args.epochs):
-                    train_loss, train_acc = train_transformer_epoch(model, train_loader, optimizer, device, loss_name=getattr(model_args, 'loss', None))
-                    valid_loss, valid_acc = eval_transformer_epoch(model, valid_loader, device, loss_name=getattr(model_args, 'loss', None))
+                    train_loss, train_acc, train_f1 = train_transformer_epoch(model, train_loader, optimizer, device, loss_name=getattr(model_args, 'loss', None))
+                    valid_loss, valid_acc, valid_f1 = eval_transformer_epoch(model, valid_loader, device, loss_name=getattr(model_args, 'loss', None))
                     scheduler.step()
 
                     # Build standardized metric dicts for transformer
-                    train_metrics = {"loss": train_loss, "accuracy": train_acc}
-                    valid_metrics = {"loss": valid_loss, "accuracy": valid_acc}
+                    train_metrics = {"loss": train_loss, "accuracy": train_acc, "f1_score": train_f1}
+                    valid_metrics = {"loss": valid_loss, "accuracy": valid_acc, "f1_score": valid_f1}
 
                     logd = _make_standard_log(epoch, model_name, "classification", train_metrics, valid_metrics, eval_metrics=getattr(model_args, 'eval_metrics', None))
                     wandb.log(logd)
@@ -341,8 +341,8 @@ def main():
                     model.load_state_dict(torch.load(str(best_path)))
                     test_loader = v.get("test_loader")
                     if test_loader is not None:
-                        test_loss, test_acc = eval_transformer_epoch(model, test_loader, device)
-                        test_metrics = {"loss": test_loss, "accuracy": test_acc}
+                        test_loss, test_acc, test_f1 = eval_transformer_epoch(model, test_loader, device)
+                        test_metrics = {"loss": test_loss, "accuracy": test_acc, "f1_score": test_f1}
                         wandb.log(_make_standard_test_log(model_name, "classification", test_metrics, eval_metrics=getattr(model_args, 'eval_metrics', None)))
                 except Exception:
                     # If loading or evaluation fails, log nothing but continue

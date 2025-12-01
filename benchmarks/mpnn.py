@@ -16,6 +16,7 @@ from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch_geometric.data import Data
 from torch_geometric.nn import GINConv, global_mean_pool
+from sklearn.metrics import f1_score
 
 
 class GraphTaskDataset(Dataset):
@@ -363,6 +364,7 @@ class GraphMPNNTrainer:
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         task_type: str = "regression",
         loss: str | None = None,
+        task_name: str | None = None,
     ):
         """
         Args:
@@ -371,11 +373,14 @@ class GraphMPNNTrainer:
             weight_decay: Weight decay for optimizer
             device: Device to train on
             task_type: "regression" or "classification"
+            loss: Loss function name (optional)
+            task_name: Task name (e.g., "shortest_path") for special handling
         """
         self.model = model
         self.device = torch.device(device)
         self.model.to(self.device)
         self.task_type = task_type
+        self.task_name = task_name or ""
         
         self.optimizer = Adam(
             model.parameters(),
@@ -402,10 +407,19 @@ class GraphMPNNTrainer:
                 self.loss_fn = _rmse
             else:
                 # Unknown loss name - fallback to defaults
-                self.loss_fn = nn.BCEWithLogitsLoss() if task_type == "classification" else nn.MSELoss()
+                self.loss_fn = self._get_default_loss_fn()
         else:
-            # Default behavior: BCE for classification, MSE for regression
-            self.loss_fn = nn.BCEWithLogitsLoss() if task_type == "classification" else nn.MSELoss()
+            # Default behavior: use MSE for shortest_path (even though it's classification for metrics),
+            # BCE for other classification tasks, MSE for regression
+            self.loss_fn = self._get_default_loss_fn()
+    
+    def _get_default_loss_fn(self):
+        """Get default loss function based on task type and task name."""
+        # Classification tasks (including shortest_path) use cross-entropy
+        if self.task_type == "classification":
+            return nn.CrossEntropyLoss()
+        # Regression tasks use MSE
+        return nn.MSELoss()
     
     def train_epoch(self, dataloader: DataLoader) -> float:
         """Train for one epoch.
@@ -424,7 +438,19 @@ class GraphMPNNTrainer:
             batch = batch.to(self.device)
             
             pred = self.model(batch)
-            label = batch.y.view(-1, 1)
+            label = batch.y
+            
+            # For classification with cross-entropy, reshape if needed
+            if self.task_type == "classification":
+                # Cross-entropy expects pred: (batch_size, num_classes), label: (batch_size,)
+                if pred.dim() > 1 and pred.size(1) == 1:
+                    # If pred has shape (batch_size, 1), treat as 2-class problem
+                    pred = pred.squeeze(-1).unsqueeze(-1)  # Keep (batch_size, 1) for BCE or reshape
+                # For cross-entropy, we need to expand to multiple classes or use binary cross-entropy equivalent
+                # For now, assume pred already has proper shape or will be handled by loss function
+                label = label.long()
+            else:
+                label = label.view(-1, 1)
             
             loss = self.loss_fn(pred, label)
             
@@ -445,7 +471,7 @@ class GraphMPNNTrainer:
             dataloader: Evaluation dataloader
         
         Returns:
-            Dictionary with metrics (loss, mae, accuracy)
+            Dictionary with metrics (loss, mae, accuracy, f1_score)
         """
         self.model.eval()
         total_loss = 0.0
@@ -454,18 +480,38 @@ class GraphMPNNTrainer:
         total_samples = 0
         num_batches = 0
         
+        # For F1 score computation in classification
+        all_preds = []
+        all_labels = []
+        
         for batch in dataloader:
             batch = batch.to(self.device)
             pred = self.model(batch)
-            label = batch.y.view(-1, 1)
+            label = batch.y
             
-            loss = self.loss_fn(pred, label)
+            # Handle label shape for loss computation
+            if self.task_type == "classification":
+                label_for_loss = label.long()
+            else:
+                label_for_loss = label.view(-1, 1)
+            
+            loss = self.loss_fn(pred, label_for_loss)
             total_loss += loss.item()
             num_batches += 1
             
             if self.task_type == "classification":
-                pred_binary = (torch.sigmoid(pred) > 0.5).float()
-                correct = (pred_binary == label).sum().item()
+                # Use argmax for multi-class classification (including shortest_path)
+                if pred.dim() > 1 and pred.size(1) > 1:
+                    # Multi-class: pred has shape (batch_size, num_classes)
+                    pred_classes = pred.argmax(dim=1)
+                else:
+                    # Binary or single output: round the predictions
+                    pred.view(-1, 1)
+                    pred_classes = torch.round(pred).to(torch.int64).squeeze(-1)
+                
+                all_preds.extend(pred_classes.cpu().numpy().flatten().tolist())
+                all_labels.extend(label.cpu().numpy().flatten().tolist())
+                correct = (pred_classes == label.long()).sum().item()
                 total_correct += correct
                 total_samples += label.size(0)
             else:
@@ -487,6 +533,11 @@ class GraphMPNNTrainer:
         
         if self.task_type == "classification":
             metrics["accuracy"] = total_correct / total_samples if total_samples > 0 else 0.0
+            # Compute F1 score for classification tasks
+            if all_labels:
+                metrics["f1_score"] = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
+            else:
+                metrics["f1_score"] = 0.0
         else:
             metrics["mae"] = total_mae / num_batches if num_batches > 0 else 0.0
             eval_metrics = getattr(self, 'eval_metrics', None) or []

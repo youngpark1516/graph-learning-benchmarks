@@ -66,12 +66,35 @@ def build_mpnn(args, device):
     is_shortest_path = "shortest_path" in task_name.lower()
     in_features = 3 if is_shortest_path else 1
     
-    model = GIN(in_features=in_features, hidden_dim=args.hidden_dim, num_layers=args.num_layers, out_features=1, dropout=0.5)
+    # Determine task type and output features for classification
+    task_type = "classification" if args.task in ["cycle_check", "shortest_path"] or "shortest_path" in args.task else "regression"
     
-    # cycle_check is classification (binary yes/no)
-    # shortest_path is regression (predicting distance: 0, 1, 2, 3, ...)
-    # other tasks default to regression
-    task_type = "classification" if args.task in ["cycle_check"] else "regression"
+    # For classification, determine number of classes from training data
+    out_features = 1
+    if task_type == "classification":
+        try:
+            labels = []
+            base_train = train_dataset.dataset if hasattr(train_dataset, 'dataset') else train_dataset
+            # Sample labels comprehensively
+            sample_size = min(len(base_train), 5000)
+            for i in range(sample_size):
+                try:
+                    _, label = base_train[i]
+                    labels.append(int(label))
+                except Exception:
+                    pass
+            if labels:
+                # For distance-based tasks like shortest_path, use max label + 1 as num_classes
+                max_label = max(labels)
+                num_classes = max_label + 1
+                out_features = max(2, num_classes)
+            else:
+                out_features = 2
+        except Exception as e:
+            print(f"Warning: Could not determine number of classes: {e}")
+            out_features = 2
+    
+    model = GIN(in_features=in_features, hidden_dim=args.hidden_dim, num_layers=args.num_layers, out_features=out_features, dropout=0.5)
     
     trainer = GraphMPNNTrainer(
         model,
@@ -79,6 +102,7 @@ def build_mpnn(args, device):
         device=device,
         task_type=task_type,
         loss=getattr(args, 'loss', None),
+        task_name=args.task,
     )
     # Propagate requested eval metrics (list or None) to trainer so it can
     # compute optional metrics like accuracy for regression tasks.
