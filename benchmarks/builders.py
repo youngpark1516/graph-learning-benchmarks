@@ -59,8 +59,20 @@ def build_mpnn(args, device):
     valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
 
-    model = GIN(in_features=1, hidden_dim=args.hidden_dim, num_layers=args.num_layers, out_features=1, dropout=0.5)
+    # Determine feature dimension based on task
+    # shortest_path tasks need query node features (3D: degree + is_source + is_target)
+    # other tasks only use node degree (1D)
+    task_name = args.task if isinstance(args.task, str) else str(args.task)
+    is_shortest_path = "shortest_path" in task_name.lower()
+    in_features = 3 if is_shortest_path else 1
+    
+    model = GIN(in_features=in_features, hidden_dim=args.hidden_dim, num_layers=args.num_layers, out_features=1, dropout=0.5)
+    
+    # cycle_check is classification (binary yes/no)
+    # shortest_path is regression (predicting distance: 0, 1, 2, 3, ...)
+    # other tasks default to regression
     task_type = "classification" if args.task in ["cycle_check"] else "regression"
+    
     trainer = GraphMPNNTrainer(
         model,
         learning_rate=args.learning_rate,
@@ -279,3 +291,290 @@ def build_graphgps(args, device):
         except Exception as e:
             raise ImportError("Could not import any GraphGPS builder (submodule or fallback).\n"
                               f"Last error: {e}")
+
+
+def build_mpnn_zinc(args, device):
+    """Build MPNN for ZINC dataset."""
+    from zinc_dataset import ZincGraphTaskDataset
+    from mpnn import GIN, GraphMPNNTrainer, collate_fn
+    
+    train_dataset = ZincGraphTaskDataset(args.data_dir, split="train", subset=True)
+    valid_dataset = ZincGraphTaskDataset(args.data_dir, split="valid", subset=True)
+    test_dataset = ZincGraphTaskDataset(args.data_dir, split="test", subset=True)
+    
+    # Optionally limit dataset sizes
+    try:
+        if getattr(args, 'max_samples_train', None) and args.max_samples_train > 0:
+            n = min(len(train_dataset), int(args.max_samples_train))
+            train_dataset = Subset(train_dataset, list(range(n)))
+        if getattr(args, 'max_samples_valid', None) and args.max_samples_valid > 0:
+            n = min(len(valid_dataset), int(args.max_samples_valid))
+            valid_dataset = Subset(valid_dataset, list(range(n)))
+        if getattr(args, 'max_samples_test', None) and args.max_samples_test > 0:
+            n = min(len(test_dataset), int(args.max_samples_test))
+            test_dataset = Subset(test_dataset, list(range(n)))
+    except Exception:
+        pass
+    
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
+    valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
+    
+    # ZINC logp is regression task
+    model = GIN(in_features=1, hidden_dim=args.hidden_dim, num_layers=args.num_layers, out_features=1, dropout=0.5)
+    trainer = GraphMPNNTrainer(
+        model,
+        learning_rate=args.learning_rate,
+        device=device,
+        task_type="regression",  # ZINC is regression (logP prediction)
+        loss=getattr(args, 'loss', None),
+    )
+    
+    try:
+        trainer.eval_metrics = getattr(args, 'eval_metrics', None)
+    except Exception:
+        trainer.eval_metrics = None
+    
+    return {
+        "train_loader": train_loader,
+        "valid_loader": valid_loader,
+        "test_loader": test_loader,
+        "trainer": trainer,
+        "task_type": "regression",
+    }
+
+
+def build_transformer_zinc(args, device, which):
+    """Build Transformer for ZINC dataset with model-specific tokenization.
+    
+    Tries to load from preprocessed data first, falls back to on-the-fly tokenization.
+    """
+    if which == "graph_transformer":
+        from graph_transformer import GraphTransformer as Transformer
+    else:
+        from autograph_transformer import GraphTransformer as AGTransformer
+        Transformer = AGTransformer
+    
+    # Try to load from preprocessed data
+    preprocessed_dir = getattr(args, 'preprocessed_zinc_dir', None)
+    if preprocessed_dir and Path(preprocessed_dir).exists():
+        from preprocess_zinc_loader import PreprocessedGraphTransformerZincDataset, PreprocessedAutoGraphTransformerZincDataset
+        
+        if which == "graph_transformer":
+            DatasetClass = PreprocessedGraphTransformerZincDataset
+        else:
+            DatasetClass = PreprocessedAutoGraphTransformerZincDataset
+        
+        try:
+            train_dataset = DatasetClass(preprocessed_dir, split="train")
+            valid_dataset = DatasetClass(preprocessed_dir, split="valid")
+            test_dataset = DatasetClass(preprocessed_dir, split="test")
+        except Exception as e:
+            print(f"Warning: Could not load preprocessed data: {e}")
+            print("Falling back to on-the-fly tokenization...")
+            preprocessed_dir = None
+    
+    # Fall back to on-the-fly tokenization
+    if not preprocessed_dir or not Path(preprocessed_dir).exists():
+        from zinc_dataset import GraphTransformerZincDataset, AutoGraphTransformerZincDataset
+        
+        if which == "graph_transformer":
+            DatasetClass = GraphTransformerZincDataset
+        else:
+            DatasetClass = AutoGraphTransformerZincDataset
+        
+        train_dataset = DatasetClass(
+            args.data_dir,
+            split="train",
+            subset=True,
+            max_seq_length=args.max_seq_length,
+        )
+        valid_dataset = DatasetClass(
+            args.data_dir,
+            split="valid",
+            subset=True,
+            max_seq_length=args.max_seq_length,
+        )
+        test_dataset = DatasetClass(
+            args.data_dir,
+            split="test",
+            subset=True,
+            max_seq_length=args.max_seq_length,
+        )
+    
+    # Optionally limit dataset sizes
+    try:
+        if getattr(args, 'max_samples_train', None) and args.max_samples_train > 0:
+            n = min(len(train_dataset), int(args.max_samples_train))
+            train_dataset = Subset(train_dataset, list(range(n)))
+        if getattr(args, 'max_samples_valid', None) and args.max_samples_valid > 0:
+            n = min(len(valid_dataset), int(args.max_samples_valid))
+            valid_dataset = Subset(valid_dataset, list(range(n)))
+        if getattr(args, 'max_samples_test', None) and args.max_samples_test > 0:
+            n = min(len(test_dataset), int(args.max_samples_test))
+            test_dataset = Subset(test_dataset, list(range(n)))
+    except Exception:
+        pass
+    
+    # Share vocabulary across splits
+    def _base(ds):
+        try:
+            if isinstance(ds, Subset):
+                return ds.dataset
+            if isinstance(ds, ConcatDataset):
+                return ds.datasets[0] if len(ds.datasets) > 0 else ds
+            return ds
+        except Exception:
+            return ds
+    
+    base_train = _base(train_dataset)
+    vocab_size = getattr(base_train, 'vocab_size', 1000)
+    
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+    
+    model = Transformer(
+        vocab_size=vocab_size,
+        d_model=args.d_model,
+        n_heads=args.n_heads,
+        n_layers=args.n_layers,
+        d_ff=args.d_ff,
+        dropout=args.dropout,
+        max_seq_length=args.max_seq_length,
+    ).to(device)
+    
+    return {
+        "train_loader": train_loader,
+        "valid_loader": valid_loader,
+        "test_loader": test_loader,
+        "model": model,
+    }
+
+
+def build_graphgps_zinc(args, device):
+    """Build GraphGPS for ZINC dataset - simplified version for PyG data."""
+    from zinc_dataset import ZincPyGDataset
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from torch_geometric.nn import TransformerConv, global_mean_pool, GINConv
+    
+    train_dataset = ZincPyGDataset(args.data_dir, split="train", subset=True)
+    valid_dataset = ZincPyGDataset(args.data_dir, split="valid", subset=True)
+    test_dataset = ZincPyGDataset(args.data_dir, split="test", subset=True)
+    
+    # Optionally limit dataset sizes
+    try:
+        if getattr(args, 'max_samples_train', None) and args.max_samples_train > 0:
+            n = min(len(train_dataset), int(args.max_samples_train))
+            train_dataset = Subset(train_dataset, list(range(n)))
+        if getattr(args, 'max_samples_valid', None) and args.max_samples_valid > 0:
+            n = min(len(valid_dataset), int(args.max_samples_valid))
+            valid_dataset = Subset(valid_dataset, list(range(n)))
+        if getattr(args, 'max_samples_test', None) and args.max_samples_test > 0:
+            n = min(len(test_dataset), int(args.max_samples_test))
+            test_dataset = Subset(test_dataset, list(range(n)))
+    except Exception:
+        pass
+    
+    # Use PyG Batch collate for graph datasets
+    from torch_geometric.data import DataLoader as PyGDataLoader
+    train_loader = PyGDataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    valid_loader = PyGDataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False)
+    test_loader = PyGDataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+    
+    # Build SimpleGPS model directly
+    batch_size = getattr(args, "batch_size", 32)
+    learning_rate = getattr(args, "learning_rate", 1e-3)
+    hidden_dim = getattr(args, "d_model", 64)
+    n_layers = max(1, getattr(args, "n_layers", 3))
+    n_heads = getattr(args, "n_heads", 4)
+    dropout = getattr(args, "dropout", 0.1)
+    
+    class SimpleGPS(nn.Module):
+        def __init__(self, in_channels: int = 1, hidden_dim: int = 64, n_layers: int = 3, n_heads: int = 4, out_dim: int = 1, dropout: float = 0.1):
+            super().__init__()
+            self.input_lin = nn.Linear(in_channels, hidden_dim)
+            self.convs = nn.ModuleList()
+            for _ in range(n_layers):
+                self.convs.append(TransformerConv(hidden_dim, max(1, hidden_dim // n_heads), heads=n_heads, dropout=dropout))
+            self.pool = global_mean_pool
+            self.mlp = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Dropout(dropout), nn.Linear(hidden_dim, out_dim))
+        
+        def forward(self, batch):
+            x, edge_index, batch_idx = batch.x, batch.edge_index, batch.batch
+            x = x.float()  # Ensure float dtype
+            x = self.input_lin(x)
+            for conv in self.convs:
+                x = conv(x, edge_index)
+                x = F.relu(x)
+            x = self.pool(x, batch_idx)
+            out = self.mlp(x)
+            return out
+    
+    model = SimpleGPS(in_channels=1, hidden_dim=hidden_dim, n_layers=n_layers, n_heads=n_heads, out_dim=1, dropout=dropout)
+    model = model.to(device)
+    
+    class Trainer:
+        def __init__(self, model, lr=1e-3, device="cpu", task_type="regression", loss: str | None = None):
+            self.model = model
+            self.device = torch.device(device)
+            self.model.to(self.device)
+            self.opt = torch.optim.Adam(self.model.parameters(), lr=lr)
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.opt, T_max=100)
+            self.task_type = task_type
+            self.loss_fn = nn.MSELoss()  # ZINC is regression
+        
+        def train_epoch(self, loader: PyGDataLoader) -> float:
+            self.model.train()
+            total = 0.0
+            n = 0
+            for batch in loader:
+                batch = batch.to(self.device)
+                pred = self.model(batch)
+                label = batch.y.view(-1, 1)
+                loss = self.loss_fn(pred, label)
+                self.opt.zero_grad()
+                loss.backward()
+                self.opt.step()
+                total += loss.item()
+                n += 1
+            return total / n if n > 0 else 0.0
+        
+        @torch.no_grad()
+        def evaluate(self, loader: PyGDataLoader) -> dict:
+            self.model.eval()
+            total = 0.0
+            total_mae = 0.0
+            n = 0
+            for batch in loader:
+                batch = batch.to(self.device)
+                pred = self.model(batch)
+                label = batch.y.view(-1, 1)
+                loss = self.loss_fn(pred, label)
+                mae = torch.mean(torch.abs(pred - label)).item()
+                total += loss.item()
+                total_mae += mae
+                n += 1
+            return {
+                "loss": total / n if n > 0 else float('nan'),
+                "mae": total_mae / n if n > 0 else float('nan'),
+            }
+        
+        def save_checkpoint(self, path: str):
+            torch.save(self.model.state_dict(), path)
+        
+        def load_checkpoint(self, path: str):
+            self.model.load_state_dict(torch.load(path, map_location=self.device))
+    
+    trainer = Trainer(model, lr=learning_rate, device=device, task_type="regression")
+    
+    return {
+        "train_loader": train_loader,
+        "valid_loader": valid_loader,
+        "test_loader": test_loader,
+        "trainer": trainer,
+        "task_type": "regression",
+    }
+
