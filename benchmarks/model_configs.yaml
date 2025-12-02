@@ -12,22 +12,23 @@ mpnn:
 
 graph_transformer:
   d_model: 32
-  n_layers: 2
-  n_heads: 1
+  n_layers: 3
+  n_heads: 4
   d_ff: 16
   run_name: gtransformer-medium
 
 autograph_transformer:
   d_model: 32
-  n_layers: 2
-  n_heads: 1
+  n_layers: 3
+  n_heads: 4
   d_ff: 16
   run_name: autograph-medium
 
 graphgps:
   d_model: 32
   n_layers: 2
-  n_heads: 1
+  n_heads: 4
   hidden_dim: 32
   mpnn_num_layers: 2
+  mpnn_hidden_dim: 32
   run_name: graphgps-medium

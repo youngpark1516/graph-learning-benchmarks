@@ -336,10 +336,16 @@ def build_graphgps(args, device: str):
     )
     model = model.to(device)
     
-    # Count parameters
+    # Count parameters and print architecture
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"[GraphGPS] Model created with {total_params} total params ({trainable_params} trainable)")
+    print(f"\n{'='*70}")
+    print(f"[GRAPHGPS] Model Architecture")
+    print(f"{'='*70}")
+    print(model)
+    print(f"\nTotal Parameters: {total_params:,}")
+    print(f"Trainable Parameters: {trainable_params:,}")
+    print(f"{'='*70}\n")
 
     class Trainer:
         def __init__(self, model, lr=1e-3, device="cpu", task_type="regression", loss: str | None = None, task_name: str | None = None):

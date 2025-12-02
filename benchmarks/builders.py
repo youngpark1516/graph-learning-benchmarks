@@ -96,6 +96,17 @@ def build_mpnn(args, device):
     
     model = GIN(in_features=in_features, hidden_dim=args.hidden_dim, num_layers=args.num_layers, out_features=out_features, dropout=0.5)
     
+    # Print model architecture
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\n{'='*70}")
+    print(f"[MPNN] Model Architecture")
+    print(f"{'='*70}")
+    print(model)
+    print(f"\nTotal Parameters: {total_params:,}")
+    print(f"Trainable Parameters: {trainable_params:,}")
+    print(f"{'='*70}\n")
+    
     trainer = GraphMPNNTrainer(
         model,
         learning_rate=args.learning_rate,
@@ -243,6 +254,19 @@ def build_transformer(args, device, which):
     # Ensure we pass the underlying dataset's vocab_size (handle Subset wrappers).
     vocab_size = getattr(base_train, 'vocab_size', None)
     model = Transformer(vocab_size=vocab_size, d_model=args.d_model, n_heads=args.n_heads, n_layers=args.n_layers, d_ff=args.d_ff, dropout=args.dropout, max_seq_length=args.max_seq_length).to(device)
+    
+    # Print model architecture
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    model_name = "Graph Transformer" if which == "graph_transformer" else "AutoGraph Transformer"
+    print(f"\n{'='*70}")
+    print(f"[{model_name.upper()}] Model Architecture")
+    print(f"{'='*70}")
+    print(model)
+    print(f"\nVocab Size: {vocab_size}")
+    print(f"Total Parameters: {total_params:,}")
+    print(f"Trainable Parameters: {trainable_params:,}")
+    print(f"{'='*70}\n")
 
     return {
         "train_loader": train_loader,

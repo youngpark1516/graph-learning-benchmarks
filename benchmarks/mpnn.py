@@ -286,7 +286,7 @@ class GIN(nn.Module):
         hidden_dim: int = 64,
         num_layers: int = 4,
         out_features: int = 1,
-        dropout: float = 0.5,
+        dropout: float = 0.1,
     ):
         """
         Args:
