@@ -67,6 +67,8 @@ def main():
     parser.add_argument("--max_samples_train", type=int, default=None, help="Limit training dataset size (useful for testing)")
     parser.add_argument("--max_samples_valid", type=int, default=None, help="Limit validation dataset size")
     parser.add_argument("--max_samples_test", type=int, default=None, help="Limit test dataset size")
+    parser.add_argument("--test_algorithm", type=str, default=None, help="Override algorithm for test dataset (default: use same as --algorithm)")
+    parser.add_argument("--test_algorithms", type=str, default=None, help="Comma-separated list of algorithms for test set (overrides --test_algorithm)")
     
     # GraphGPS-specific arguments for positional encoding and normalization
     parser.add_argument("--use_lap_pe", action="store_true", help="Enable Laplacian Positional Encoding for GraphGPS")
@@ -99,6 +101,8 @@ def main():
         "max_samples_train": None,
         "max_samples_valid": None,
         "max_samples_test": None,
+        "test_algorithm": None,
+        "test_algorithms": None,
         "use_lap_pe": False,
         "lap_pe_dim": 16,
         "norm_type": "batch",
@@ -234,6 +238,8 @@ def main():
                     pass
 
                 for epoch in range(model_args.epochs):
+                    epoch_start = time.time()
+                    
                     # train step
                     _ = trainer.train_epoch(train_loader)
 
@@ -242,6 +248,11 @@ def main():
                     valid_metrics = trainer.evaluate(valid_loader)
 
                     logd = _make_standard_log(epoch, model_name, v["task_type"], train_metrics, valid_metrics, eval_metrics=getattr(model_args, 'eval_metrics', None))
+                    
+                    # Add epoch timing
+                    epoch_time = time.time() - epoch_start
+                    logd["epoch_time"] = epoch_time
+                    
                     wandb.log(logd)
 
                     valid_loss = valid_metrics.get("loss", float("inf"))
@@ -278,6 +289,8 @@ def main():
                     pass
 
                 for epoch in range(model_args.epochs):
+                    epoch_start = time.time()
+                    
                     # train step
                     _ = trainer.train_epoch(train_loader)
 
@@ -286,6 +299,11 @@ def main():
                     valid_metrics = trainer.evaluate(valid_loader)
 
                     logd = _make_standard_log(epoch, model_name, v["task_type"], train_metrics, valid_metrics, eval_metrics=getattr(model_args, 'eval_metrics', None))
+                    
+                    # Add epoch timing
+                    epoch_time = time.time() - epoch_start
+                    logd["epoch_time"] = epoch_time
+                    
                     wandb.log(logd)
 
                     valid_loss = valid_metrics.get("loss", float("inf"))
@@ -320,6 +338,8 @@ def main():
                 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, model_args.epochs))
 
                 for epoch in range(model_args.epochs):
+                    epoch_start = time.time()
+                    
                     train_loss, train_acc, train_f1 = train_transformer_epoch(model, train_loader, optimizer, device, loss_name=getattr(model_args, 'loss', None))
                     valid_loss, valid_acc, valid_f1 = eval_transformer_epoch(model, valid_loader, device, loss_name=getattr(model_args, 'loss', None))
                     scheduler.step()
@@ -329,6 +349,11 @@ def main():
                     valid_metrics = {"loss": valid_loss, "accuracy": valid_acc, "f1_score": valid_f1}
 
                     logd = _make_standard_log(epoch, model_name, "classification", train_metrics, valid_metrics, eval_metrics=getattr(model_args, 'eval_metrics', None))
+                    
+                    # Add epoch timing
+                    epoch_time = time.time() - epoch_start
+                    logd["epoch_time"] = epoch_time
+                    
                     wandb.log(logd)
 
                     # save best

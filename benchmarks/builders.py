@@ -13,8 +13,8 @@ def build_mpnn(args, device):
     from mpnn import GraphTaskDataset, GIN, GraphMPNNTrainer, collate_fn
 
     # Allow `args.algorithm` to be a list/tuple to form a union of datasets
-    def _maybe_concat(fn, split, *extra_args, **kwargs):
-        algo = args.algorithm
+    def _maybe_concat(fn, split, algo=None, *extra_args, **kwargs):
+        algo = algo or args.algorithm
         if isinstance(algo, (list, tuple)):
             ds_list = [fn(args.data_dir, args.task, a, split, *extra_args, **kwargs) for a in algo]
             concat = ConcatDataset(ds_list)
@@ -38,7 +38,9 @@ def build_mpnn(args, device):
 
     train_dataset = _maybe_concat(GraphTaskDataset, "train")
     valid_dataset = _maybe_concat(GraphTaskDataset, "valid")
-    test_dataset = _maybe_concat(GraphTaskDataset, "test")
+    # Use test_algorithm if provided, otherwise use training algorithm
+    test_algo = args.test_algorithm or args.algorithm
+    test_dataset = _maybe_concat(GraphTaskDataset, "test", test_algo)
 
     # Optionally limit dataset sizes via args (set in model config or CLI overrides)
     try:
@@ -141,8 +143,8 @@ def build_transformer(args, device, which):
         Transformer = AGTransformer
 
     # Forward sampling args so datasets can sample `n_samples_per_file` per JSON
-    def _maybe_concat_graphdataset(split):
-        algo = args.algorithm
+    def _maybe_concat_graphdataset(split, algo=None):
+        algo = algo or args.algorithm
         common_kwargs = dict(
             max_seq_length=args.max_seq_length,
             n_samples_per_file=getattr(args, 'n_samples_per_file', -1),
@@ -168,7 +170,9 @@ def build_transformer(args, device, which):
 
     train_dataset = _maybe_concat_graphdataset("train")
     valid_dataset = _maybe_concat_graphdataset("valid")
-    test_dataset = _maybe_concat_graphdataset("test")
+    # Use test_algorithm if provided, otherwise use training algorithm
+    test_algo = args.test_algorithm or args.algorithm
+    test_dataset = _maybe_concat_graphdataset("test", test_algo)
 
     # Optionally limit dataset sizes via args (set in model config or CLI overrides)
     try:

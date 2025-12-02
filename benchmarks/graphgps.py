@@ -85,6 +85,8 @@ def build_graphgps(args, device: str):
     data_dir = args.data_dir
     task = args.task
     algorithm = args.algorithm
+    # Use test_algorithm if provided, otherwise use training algorithm
+    test_algorithm = getattr(args, 'test_algorithm', None) or algorithm
 
     # Respect a broad set of configuration keys so `graphgps` can be
     # configured similarly to `mpnn` and transformer models.
@@ -128,7 +130,7 @@ def build_graphgps(args, device: str):
         data_path=data_dir,
         split="test",
         task=task,
-        algorithm=algorithm if isinstance(algorithm, str) else algorithm[0],
+        algorithm=test_algorithm if isinstance(test_algorithm, str) else test_algorithm[0],
         add_query_features=True
     )
 

@@ -662,7 +662,7 @@ def main(
         hidden_dim=hidden_dim,
         num_layers=num_layers,
         out_features=1,
-        dropout=0.5,
+        dropout=0.1,
     )
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
