@@ -646,3 +646,311 @@ def build_graphgps_zinc(args, device):
         "task_type": "regression",
     }
 
+
+def build_zinc_mpnn(args, device):
+    """Build MPNN (GIN) for ZINC molecular property prediction.
+    
+    ZINC is a regression task predicting molecular properties.
+    """
+    from zinc_dataset import ZINCLoader
+    from mpnn import GIN, GraphMPNNTrainer, collate_fn
+    
+    # Load ZINC dataset - return tuples for MPNN collate_fn
+    subset = not ("250" in str(getattr(args, 'task', 'zinc')))
+    data_dir = getattr(args, 'data_dir', None) or "./data/ZINC"
+    
+    train_dataset = ZINCLoader.load_pyg_data(root=data_dir, split="train", subset=subset, return_tuple=True)
+    valid_dataset = ZINCLoader.load_pyg_data(root=data_dir, split="val", subset=subset, return_tuple=True)
+    test_dataset = ZINCLoader.load_pyg_data(root=data_dir, split="test", subset=subset, return_tuple=True)
+    
+    # Create dataloaders
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
+    valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
+    
+    # Get feature dimension from first sample
+    sample = train_dataset[0]
+    in_features = sample.x.shape[1] if hasattr(sample, 'x') and sample.x is not None else 1
+    
+    # Build GIN model for regression
+    model = GIN(
+        in_features=in_features,
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers,
+        out_features=1,  # Regression: single output
+        dropout=0.5
+    )
+    
+    # Print model info
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\n{'='*70}")
+    print(f"[ZINC MPNN] Model Architecture")
+    print(f"{'='*70}")
+    print(model)
+    print(f"\nTotal Parameters: {total_params:,}")
+    print(f"Trainable Parameters: {trainable_params:,}")
+    print(f"{'='*70}\n")
+    
+    # Build trainer with MAE loss for regression
+    trainer = GraphMPNNTrainer(
+        model,
+        learning_rate=args.learning_rate,
+        device=device,
+        task_type="regression",
+        loss=getattr(args, 'loss', None) or 'mae',
+        task_name="zinc"
+    )
+    trainer.eval_metrics = getattr(args, 'eval_metrics', None)
+    
+    return {
+        "train_loader": train_loader,
+        "valid_loader": valid_loader,
+        "test_loader": test_loader,
+        "trainer": trainer,
+        "task_type": "regression",
+    }
+
+
+def build_zinc_transformer(args, device, which="graph_transformer", use_autograph: bool = False):
+    """Build Transformer for ZINC molecular property prediction.
+    
+    Tokenizes molecular graphs for transformer processing.
+    
+    Args:
+        args: Configuration arguments
+        device: Torch device (cuda or cpu)
+        which: Model type identifier
+        use_autograph: If True, use AutoGraph's trail-based tokenization
+    """
+    from zinc_dataset import ZINCLoader
+    from graph_transformer import GraphTransformer as Transformer
+    
+    # Load ZINC dataset
+    subset = not ("250" in str(getattr(args, 'task', 'zinc')))
+    data_dir = getattr(args, 'data_dir', None) or "./data/ZINC"
+    
+    train_dataset = ZINCLoader.load_tokenized_data(
+        root=data_dir,
+        split="train",
+        subset=subset,
+        max_seq_len=args.max_seq_length,
+        use_autograph=use_autograph,
+        random_seed=getattr(args, 'random_seed', 1234)
+    )
+    valid_dataset = ZINCLoader.load_tokenized_data(
+        root=data_dir,
+        split="val",
+        subset=subset,
+        max_seq_len=args.max_seq_length,
+        use_autograph=use_autograph,
+        random_seed=getattr(args, 'random_seed', 1235)
+    )
+    test_dataset = ZINCLoader.load_tokenized_data(
+        root=data_dir,
+        split="test",
+        subset=subset,
+        max_seq_len=args.max_seq_length,
+        use_autograph=use_autograph,
+        random_seed=getattr(args, 'random_seed', 1236)
+    )
+    
+    # Propagate vocabulary
+    try:
+        if hasattr(train_dataset, 'token2idx'):
+            valid_dataset.token2idx = train_dataset.token2idx
+            test_dataset.token2idx = train_dataset.token2idx
+    except Exception:
+        pass
+    
+    # Create dataloaders
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+    
+    # Get vocab size
+    vocab_size = len(train_dataset.token2idx) if hasattr(train_dataset, 'token2idx') else 200
+    
+    # Build transformer for regression
+    # Wrap Transformer for regression: use mean pooling of hidden states -> linear layer
+    base_model = Transformer(
+        vocab_size=vocab_size,
+        d_model=args.d_model,
+        n_heads=args.n_heads,
+        n_layers=args.n_layers,
+        d_ff=args.d_ff,
+        dropout=args.dropout,
+        max_seq_length=args.max_seq_length,
+    ).to(device)
+    
+    # Create regression wrapper
+    class TransformerRegressor(torch.nn.Module):
+        def __init__(self, transformer, d_model):
+            super().__init__()
+            self.transformer = transformer
+            self.head = torch.nn.Linear(d_model, 1)
+        
+        def forward(self, input_ids, attention_mask=None):
+            # Get transformer encoder output
+            x = self.transformer.token_embedding(input_ids)
+            x = x + self.transformer.position_embedding[:input_ids.size(1)].unsqueeze(0)
+            x = self.transformer.dropout(x)
+            key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
+            x = x.transpose(0, 1)
+            for layer in self.transformer.encoder_layers:
+                x = layer(x, mask=key_padding_mask)
+            x = x.transpose(0, 1)
+            
+            # Mean pool over sequence
+            if attention_mask is not None:
+                x_masked = x * attention_mask.unsqueeze(-1)
+                x_mean = x_masked.sum(dim=1) / attention_mask.sum(dim=1, keepdim=True).clamp(min=1)
+            else:
+                x_mean = x.mean(dim=1)
+            
+            # Regression head
+            out = self.head(x_mean)
+            return out
+    
+    model = TransformerRegressor(base_model, args.d_model).to(device)
+    
+    # Print model info
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    tokenizer_type = "AutoGraph" if use_autograph else "Simple"
+    print(f"\n{'='*70}")
+    print(f"[ZINC {which.upper()}] Model Architecture (Tokenizer: {tokenizer_type})")
+    print(f"{'='*70}")
+    print(model)
+    print(f"\nVocab Size: {vocab_size}")
+    print(f"Total Parameters: {total_params:,}")
+    print(f"Trainable Parameters: {trainable_params:,}")
+    print(f"{'='*70}\n")
+    
+    return {
+        "train_loader": train_loader,
+        "valid_loader": valid_loader,
+        "test_loader": test_loader,
+        "model": model,
+        "task_type": "regression",
+    }
+
+
+def build_zinc_graphgps(args, device):
+    """Build GraphGPS for ZINC molecular property prediction."""
+    from zinc_dataset import ZINCLoader
+    from torch_geometric.data import DataLoader as PyGDataLoader
+    
+    # Load ZINC dataset - return Data objects (not tuples) for PyG DataLoader
+    subset = not ("250" in str(getattr(args, 'task', 'zinc')))
+    data_dir = getattr(args, 'data_dir', None) or "./data/ZINC"
+    
+    train_dataset = ZINCLoader.load_pyg_data(root=data_dir, split="train", subset=subset, return_tuple=False)
+    valid_dataset = ZINCLoader.load_pyg_data(root=data_dir, split="val", subset=subset, return_tuple=False)
+    test_dataset = ZINCLoader.load_pyg_data(root=data_dir, split="test", subset=subset, return_tuple=False)
+    
+    # Create dataloaders - PyG DataLoader will handle batching
+    train_loader = PyGDataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    valid_loader = PyGDataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False)
+    test_loader = PyGDataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+    
+    # Get feature dimension from first sample
+    sample = train_dataset[0]
+    in_features = sample.x.shape[1] if hasattr(sample, 'x') and sample.x is not None else 1
+    
+    # Create simple GPS model
+    from torch_geometric.nn import TransformerConv, global_mean_pool
+    import torch.nn.functional as F
+    
+    class SimpleGPSRegressor(torch.nn.Module):
+        """Simple GPS-style model for molecular regression."""
+        
+        def __init__(self, in_features, hidden_dim, n_layers, n_heads, dropout=0.1):
+            super().__init__()
+            self.in_proj = torch.nn.Linear(in_features, hidden_dim)
+            self.layers = torch.nn.ModuleList([
+                TransformerConv(hidden_dim, hidden_dim // n_heads, n_heads, dropout=dropout, edge_dim=None, concat=True)
+                for _ in range(n_layers)
+            ])
+            self.out_proj = torch.nn.Linear(hidden_dim, 1)  # Regression output
+        
+        def forward(self, data):
+            x = self.in_proj(data.x)
+            for layer in self.layers:
+                x = layer(x, data.edge_index)
+                x = F.dropout(x, p=0.1, training=self.training)
+            x = global_mean_pool(x, data.batch)
+            return self.out_proj(x)
+    
+    model = SimpleGPSRegressor(
+        in_features=in_features,
+        hidden_dim=args.hidden_dim,
+        n_layers=args.num_layers if hasattr(args, 'num_layers') else args.n_layers,
+        n_heads=args.n_heads,
+        dropout=args.dropout
+    ).to(device)
+    
+    # Print model info
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\n{'='*70}")
+    print(f"[ZINC GraphGPS] Model Architecture")
+    print(f"{'='*70}")
+    print(model)
+    print(f"\nTotal Parameters: {total_params:,}")
+    print(f"Trainable Parameters: {trainable_params:,}")
+    print(f"{'='*70}\n")
+    
+    # Simple trainer class
+    class SimpleTrainer:
+        def __init__(self, model, lr, device, task_type="regression"):
+            self.model = model
+            self.device = device
+            self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+            self.loss_fn = torch.nn.L1Loss()  # MAE loss
+        
+        def train_epoch(self, loader):
+            self.model.train()
+            total_loss = 0.0
+            for batch in loader:
+                batch = batch.to(self.device)
+                self.optimizer.zero_grad()
+                pred = self.model(batch)
+                loss = self.loss_fn(pred, batch.y.view(-1, 1))
+                loss.backward()
+                self.optimizer.step()
+                total_loss += loss.item()
+            return total_loss / len(loader) if len(loader) > 0 else 0.0
+        
+        @torch.no_grad()
+        def evaluate(self, loader):
+            self.model.eval()
+            total_loss = 0.0
+            total_mae = 0.0
+            for batch in loader:
+                batch = batch.to(self.device)
+                pred = self.model(batch)
+                loss = self.loss_fn(pred, batch.y.view(-1, 1))
+                mae = torch.mean(torch.abs(pred - batch.y.view(-1, 1))).item()
+                total_loss += loss.item()
+                total_mae += mae
+            n = len(loader) if len(loader) > 0 else 1
+            return {"loss": total_loss / n, "mae": total_mae / n}
+        
+        def save_checkpoint(self, path):
+            torch.save(self.model.state_dict(), path)
+        
+        def load_checkpoint(self, path):
+            self.model.load_state_dict(torch.load(path, map_location=self.device))
+    
+    trainer = SimpleTrainer(model, lr=args.learning_rate, device=device)
+    trainer.eval_metrics = getattr(args, 'eval_metrics', None)
+    
+    return {
+        "train_loader": train_loader,
+        "valid_loader": valid_loader,
+        "test_loader": test_loader,
+        "trainer": trainer,
+        "task_type": "regression",
+    }
+
