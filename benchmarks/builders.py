@@ -43,16 +43,24 @@ def build_mpnn(args, device):
     test_dataset = _maybe_concat(GraphTaskDataset, "test", test_algo)
 
     # Optionally limit dataset sizes via args (set in model config or CLI overrides)
+    # For multi-algorithm datasets (ConcatDataset), sample uniformly across all algorithms
     try:
-        if getattr(args, 'max_samples_train', None) and args.max_samples_train > 0:
-            n = min(len(train_dataset), int(args.max_samples_train))
-            train_dataset = Subset(train_dataset, list(range(n)))
-        if getattr(args, 'max_samples_valid', None) and args.max_samples_valid > 0:
-            n = min(len(valid_dataset), int(args.max_samples_valid))
-            valid_dataset = Subset(valid_dataset, list(range(n)))
-        if getattr(args, 'max_samples_test', None) and args.max_samples_test > 0:
-            n = min(len(test_dataset), int(args.max_samples_test))
-            test_dataset = Subset(test_dataset, list(range(n)))
+        import random
+        
+        def _sample_subset(dataset, max_samples, seed=42):
+            """Sample uniformly from dataset (important for ConcatDataset with multiple algos)."""
+            if max_samples is None or max_samples <= 0:
+                return dataset
+            
+            n = min(len(dataset), int(max_samples))
+            # Use random sampling instead of range() to avoid bias
+            rng = random.Random(seed)
+            indices = sorted(rng.sample(range(len(dataset)), n))
+            return Subset(dataset, indices)
+        
+        train_dataset = _sample_subset(train_dataset, getattr(args, 'max_samples_train', None), seed=42)
+        valid_dataset = _sample_subset(valid_dataset, getattr(args, 'max_samples_valid', None), seed=43)
+        test_dataset = _sample_subset(test_dataset, getattr(args, 'max_samples_test', None), seed=44)
     except Exception:
         # Keep original datasets on any error
         pass
@@ -175,16 +183,24 @@ def build_transformer(args, device, which):
     test_dataset = _maybe_concat_graphdataset("test", test_algo)
 
     # Optionally limit dataset sizes via args (set in model config or CLI overrides)
+    # For multi-algorithm datasets (ConcatDataset), sample uniformly across all algorithms
     try:
-        if getattr(args, 'max_samples_train', None) and args.max_samples_train > 0:
-            n = min(len(train_dataset), int(args.max_samples_train))
-            train_dataset = Subset(train_dataset, list(range(n)))
-        if getattr(args, 'max_samples_valid', None) and args.max_samples_valid > 0:
-            n = min(len(valid_dataset), int(args.max_samples_valid))
-            valid_dataset = Subset(valid_dataset, list(range(n)))
-        if getattr(args, 'max_samples_test', None) and args.max_samples_test > 0:
-            n = min(len(test_dataset), int(args.max_samples_test))
-            test_dataset = Subset(test_dataset, list(range(n)))
+        import random
+        
+        def _sample_subset(dataset, max_samples, seed=42):
+            """Sample uniformly from dataset (important for ConcatDataset with multiple algos)."""
+            if max_samples is None or max_samples <= 0:
+                return dataset
+            
+            n = min(len(dataset), int(max_samples))
+            # Use random sampling instead of range() to avoid bias
+            rng = random.Random(seed)
+            indices = sorted(rng.sample(range(len(dataset)), n))
+            return Subset(dataset, indices)
+        
+        train_dataset = _sample_subset(train_dataset, getattr(args, 'max_samples_train', None), seed=42)
+        valid_dataset = _sample_subset(valid_dataset, getattr(args, 'max_samples_valid', None), seed=43)
+        test_dataset = _sample_subset(test_dataset, getattr(args, 'max_samples_test', None), seed=44)
     except Exception:
         # Keep original datasets on any error
         pass
