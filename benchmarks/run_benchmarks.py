@@ -19,8 +19,8 @@ import wandb
 
 # Import modular helpers
 from common import add_repo_path, _make_standard_log, _make_standard_test_log
-from builders import build_mpnn as builders_build_mpnn, build_transformer as builders_build_transformer, build_graphgps as builders_build_graphgps
-from train_utils import train_transformer_epoch as tu_train_transformer_epoch, eval_transformer_epoch as tu_eval_transformer_epoch
+from builders import build_mpnn as builders_build_mpnn, build_transformer as builders_build_transformer, build_graphgps as builders_build_graphgps, build_zinc_mpnn, build_zinc_transformer, build_zinc_graphgps
+from train_utils import train_transformer_epoch as tu_train_transformer_epoch, eval_transformer_epoch as tu_eval_transformer_epoch, train_regression_epoch as tu_train_regression_epoch, eval_regression_epoch as tu_eval_regression_epoch
 
 
 def build_mpnn(args, device):
@@ -40,8 +40,8 @@ def train_transformer_epoch(model, dataloader, optimizer, device, loss_name: str
 
 
 @torch.no_grad()
-def eval_transformer_epoch(model, dataloader, device, loss_name: str | None = None):
-    return tu_eval_transformer_epoch(model, dataloader, device, loss_name=loss_name)
+def eval_transformer_epoch(model, dataloader, device, loss_name: str | None = None, task_name: str = ""):
+    return tu_eval_transformer_epoch(model, dataloader, device, loss_name=loss_name, task_name=task_name)
 
 
 def main():
@@ -67,6 +67,8 @@ def main():
     parser.add_argument("--max_samples_train", type=int, default=None, help="Limit training dataset size (useful for testing)")
     parser.add_argument("--max_samples_valid", type=int, default=None, help="Limit validation dataset size")
     parser.add_argument("--max_samples_test", type=int, default=None, help="Limit test dataset size")
+    parser.add_argument("--test_algorithm", type=str, default=None, help="Override algorithm for test dataset (default: use same as --algorithm)")
+    parser.add_argument("--test_algorithms", type=str, default=None, help="Comma-separated list of algorithms for test set (overrides --test_algorithm)")
     
     # GraphGPS-specific arguments for positional encoding and normalization
     parser.add_argument("--use_lap_pe", action="store_true", help="Enable Laplacian Positional Encoding for GraphGPS")
@@ -99,6 +101,8 @@ def main():
         "max_samples_train": None,
         "max_samples_valid": None,
         "max_samples_test": None,
+        "test_algorithm": None,
+        "test_algorithms": None,
         "use_lap_pe": False,
         "lap_pe_dim": 16,
         "norm_type": "batch",
@@ -142,12 +146,21 @@ def main():
                     model_cfg = {}
     # Extract top-level `global` config if present. These values will be merged
     # into each model's per-model overrides (per-model keys win on conflict).
+    # For ZINC tasks, prefer zinc-specific global config
+    is_zinc_task = "zinc" in str(args.task).lower()
+    
     global_cfg = {}
-    if isinstance(model_cfg, dict) and 'global' in model_cfg:
-        try:
-            global_cfg = model_cfg.get('global', {}) or {}
-        except Exception:
-            global_cfg = {}
+    if isinstance(model_cfg, dict):
+        if is_zinc_task and 'zinc_global' in model_cfg:
+            try:
+                global_cfg = model_cfg.get('zinc_global', {}) or {}
+            except Exception:
+                global_cfg = {}
+        elif 'global' in model_cfg:
+            try:
+                global_cfg = model_cfg.get('global', {}) or {}
+            except Exception:
+                global_cfg = {}
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -174,7 +187,11 @@ def main():
             # run receives its own hyperparameters.
             # Merge `global` config with per-model overrides. Per-model keys override global ones.
             if isinstance(model_cfg, dict):
-                per_model = model_cfg.get(model_name, {}) or {}
+                # For ZINC tasks, prefer zinc_{model_name} config
+                if is_zinc_task:
+                    per_model = model_cfg.get(f"zinc_{model_name}", {}) or {}
+                else:
+                    per_model = model_cfg.get(model_name, {}) or {}
             else:
                 per_model = {}
             overrides = dict(global_cfg) if isinstance(global_cfg, dict) else {}
@@ -216,7 +233,109 @@ def main():
             best_valid = float("inf")
             best_path = out_dir / f"{model_name}_best.pt"
 
-            if model_name == "mpnn":
+            # Check if task is ZINC
+            is_zinc_task = "zinc" in str(model_args.task).lower()
+
+            if is_zinc_task:
+                # Route to ZINC-specific builders
+                if model_name == "mpnn":
+                    v = build_zinc_mpnn(model_args, device)
+                elif model_name == "graphgps":
+                    v = build_zinc_graphgps(model_args, device)
+                else:
+                    v = build_zinc_transformer(model_args, device, model_name)
+                
+                # ZINC uses trainer-based models (MPNN, GraphGPS) or direct models (Transformers)
+                if "trainer" in v:
+                    trainer = v["trainer"]
+                    train_loader = v["train_loader"]
+                    valid_loader = v["valid_loader"]
+                    test_loader = v["test_loader"]
+                    task_type = v["task_type"]
+                    
+                    # Compute and log parameter counts
+                    try:
+                        model_obj = trainer.model
+                        total_params = sum(p.numel() for p in model_obj.parameters())
+                        trainable_params = sum(p.numel() for p in model_obj.parameters() if p.requires_grad)
+                        print(f"ZINC {model_name.upper()} params: total={total_params}, trainable={trainable_params}")
+                        wandb.log({"param_count/total": total_params, "param_count/trainable": trainable_params})
+                    except Exception:
+                        pass
+                    
+                    # Training loop for ZINC with trainer
+                    for epoch in range(model_args.epochs):
+                        epoch_start = time.time()
+                        _ = trainer.train_epoch(train_loader)
+                        train_metrics = trainer.evaluate(train_loader)
+                        valid_metrics = trainer.evaluate(valid_loader)
+                        
+                        logd = _make_standard_log(epoch, model_name, task_type, train_metrics, valid_metrics, eval_metrics=getattr(model_args, 'eval_metrics', None))
+                        epoch_time = time.time() - epoch_start
+                        logd["epoch_time"] = epoch_time
+                        wandb.log(logd)
+                        
+                        valid_loss = valid_metrics.get("loss", float("inf"))
+                        if valid_loss < best_valid:
+                            best_valid = valid_loss
+                            trainer.save_checkpoint(str(best_path))
+                    
+                    # Evaluate on test set
+                    trainer.load_checkpoint(str(best_path))
+                    test_metrics = trainer.evaluate(test_loader)
+                    wandb.log(_make_standard_test_log(model_name, task_type, test_metrics, eval_metrics=getattr(model_args, 'eval_metrics', None)))
+                    
+                    if getattr(model_args, 'log_model', False):
+                        wandb.save(str(best_path))
+                else:
+                    # Transformer-based model
+                    model = v["model"]
+                    train_loader = v["train_loader"]
+                    valid_loader = v["valid_loader"]
+                    test_loader = v["test_loader"]
+                    task_type = v["task_type"]
+                    
+                    # Compute and log parameter counts
+                    try:
+                        total_params = sum(p.numel() for p in model.parameters())
+                        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                        print(f"ZINC {model_name.upper()} params: total={total_params}, trainable={trainable_params}")
+                        wandb.log({"param_count/total": total_params, "param_count/trainable": trainable_params})
+                    except Exception:
+                        pass
+                    
+                    optimizer = torch.optim.Adam(model.parameters(), lr=model_args.learning_rate)
+                    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, model_args.epochs))
+                    
+                    # Training loop for ZINC transformer (regression)
+                    for epoch in range(model_args.epochs):
+                        epoch_start = time.time()
+                        train_loss, train_mae, train_rmse = tu_train_regression_epoch(model, train_loader, optimizer, device, loss_name=getattr(model_args, 'loss', None))
+                        valid_loss, valid_mae, valid_rmse = tu_eval_regression_epoch(model, valid_loader, device, loss_name=getattr(model_args, 'loss', None))
+                        scheduler.step()
+                        
+                        train_metrics = {"loss": train_loss, "mae": train_mae, "rmse": train_rmse}
+                        valid_metrics = {"loss": valid_loss, "mae": valid_mae, "rmse": valid_rmse}
+                        
+                        logd = _make_standard_log(epoch, model_name, task_type, train_metrics, valid_metrics, eval_metrics=getattr(model_args, 'eval_metrics', None))
+                        epoch_time = time.time() - epoch_start
+                        logd["epoch_time"] = epoch_time
+                        wandb.log(logd)
+                        
+                        if valid_loss < best_valid:
+                            best_valid = valid_loss
+                            torch.save(model.state_dict(), str(best_path))
+                    
+                    # Evaluate on test set
+                    model.load_state_dict(torch.load(str(best_path)))
+                    test_loss, test_mae, test_rmse = tu_eval_regression_epoch(model, test_loader, device, loss_name=getattr(model_args, 'loss', None))
+                    test_metrics = {"loss": test_loss, "mae": test_mae, "rmse": test_rmse}
+                    wandb.log(_make_standard_test_log(model_name, task_type, test_metrics, eval_metrics=getattr(model_args, 'eval_metrics', None)))
+                    
+                    if getattr(model_args, 'log_model', False):
+                        wandb.save(str(best_path))
+
+            elif model_name == "mpnn":
                 v = build_mpnn(model_args, device)
                 trainer = v["trainer"]
                 train_loader = v["train_loader"]
@@ -234,6 +353,8 @@ def main():
                     pass
 
                 for epoch in range(model_args.epochs):
+                    epoch_start = time.time()
+                    
                     # train step
                     _ = trainer.train_epoch(train_loader)
 
@@ -242,6 +363,11 @@ def main():
                     valid_metrics = trainer.evaluate(valid_loader)
 
                     logd = _make_standard_log(epoch, model_name, v["task_type"], train_metrics, valid_metrics, eval_metrics=getattr(model_args, 'eval_metrics', None))
+                    
+                    # Add epoch timing
+                    epoch_time = time.time() - epoch_start
+                    logd["epoch_time"] = epoch_time
+                    
                     wandb.log(logd)
 
                     valid_loss = valid_metrics.get("loss", float("inf"))
@@ -278,6 +404,8 @@ def main():
                     pass
 
                 for epoch in range(model_args.epochs):
+                    epoch_start = time.time()
+                    
                     # train step
                     _ = trainer.train_epoch(train_loader)
 
@@ -286,6 +414,11 @@ def main():
                     valid_metrics = trainer.evaluate(valid_loader)
 
                     logd = _make_standard_log(epoch, model_name, v["task_type"], train_metrics, valid_metrics, eval_metrics=getattr(model_args, 'eval_metrics', None))
+                    
+                    # Add epoch timing
+                    epoch_time = time.time() - epoch_start
+                    logd["epoch_time"] = epoch_time
+                    
                     wandb.log(logd)
 
                     valid_loss = valid_metrics.get("loss", float("inf"))
@@ -320,15 +453,32 @@ def main():
                 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, model_args.epochs))
 
                 for epoch in range(model_args.epochs):
-                    train_loss, train_acc = train_transformer_epoch(model, train_loader, optimizer, device, loss_name=getattr(model_args, 'loss', None))
-                    valid_loss, valid_acc = eval_transformer_epoch(model, valid_loader, device, loss_name=getattr(model_args, 'loss', None))
+                    epoch_start = time.time()
+                    
+                    train_loss, train_acc, train_f1 = train_transformer_epoch(model, train_loader, optimizer, device, loss_name=getattr(model_args, 'loss', None))
+                    valid_result = eval_transformer_epoch(model, valid_loader, device, loss_name=getattr(model_args, 'loss', None), task_name=model_args.task)
+                    
+                    # Handle variable return values (with/without MAE)
+                    if len(valid_result) == 4:
+                        valid_loss, valid_acc, valid_f1, valid_mae = valid_result
+                    else:
+                        valid_loss, valid_acc, valid_f1 = valid_result
+                        valid_mae = None
+                    
                     scheduler.step()
 
                     # Build standardized metric dicts for transformer
-                    train_metrics = {"loss": train_loss, "accuracy": train_acc}
-                    valid_metrics = {"loss": valid_loss, "accuracy": valid_acc}
+                    train_metrics = {"loss": train_loss, "accuracy": train_acc, "f1_score": train_f1}
+                    valid_metrics = {"loss": valid_loss, "accuracy": valid_acc, "f1_score": valid_f1}
+                    if valid_mae is not None:
+                        valid_metrics["mae"] = valid_mae
 
                     logd = _make_standard_log(epoch, model_name, "classification", train_metrics, valid_metrics, eval_metrics=getattr(model_args, 'eval_metrics', None))
+                    
+                    # Add epoch timing
+                    epoch_time = time.time() - epoch_start
+                    logd["epoch_time"] = epoch_time
+                    
                     wandb.log(logd)
 
                     # save best
@@ -341,8 +491,16 @@ def main():
                     model.load_state_dict(torch.load(str(best_path)))
                     test_loader = v.get("test_loader")
                     if test_loader is not None:
-                        test_loss, test_acc = eval_transformer_epoch(model, test_loader, device)
-                        test_metrics = {"loss": test_loss, "accuracy": test_acc}
+                        test_result = eval_transformer_epoch(model, test_loader, device, task_name=model_args.task)
+                        if len(test_result) == 4:
+                            test_loss, test_acc, test_f1, test_mae = test_result
+                        else:
+                            test_loss, test_acc, test_f1 = test_result
+                            test_mae = None
+                        
+                        test_metrics = {"loss": test_loss, "accuracy": test_acc, "f1_score": test_f1}
+                        if test_mae is not None:
+                            test_metrics["mae"] = test_mae
                         wandb.log(_make_standard_test_log(model_name, "classification", test_metrics, eval_metrics=getattr(model_args, 'eval_metrics', None)))
                 except Exception:
                     # If loading or evaluation fails, log nothing but continue

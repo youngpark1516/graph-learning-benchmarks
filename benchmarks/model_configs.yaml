@@ -7,27 +7,65 @@ global:
 
 mpnn:
   hidden_dim: 64
-  num_layers: 4
+  num_layers: 3
   run_name: mpnn-medium
 
 graph_transformer:
   d_model: 32
   n_layers: 2
-  n_heads: 1
+  n_heads: 4
   d_ff: 16
   run_name: gtransformer-medium
 
 autograph_transformer:
   d_model: 32
   n_layers: 2
-  n_heads: 1
+  n_heads: 4
   d_ff: 16
   run_name: autograph-medium
 
 graphgps:
   d_model: 32
   n_layers: 2
-  n_heads: 1
+  n_heads: 4
   hidden_dim: 32
   mpnn_num_layers: 2
+  mpnn_hidden_dim: 32
   run_name: graphgps-medium
+
+# ZINC-specific configurations for molecular property prediction
+zinc_global:
+  device: cuda
+  batch_size: 32
+  learning_rate: 0.0001
+  loss: mae
+  eval_metrics: [mae, rmse]
+
+zinc_mpnn:
+  hidden_dim: 64
+  num_layers: 5
+  run_name: mpnn-zinc
+
+zinc_graph_transformer:
+  d_model: 32
+  n_layers: 2
+  n_heads: 4
+  d_ff: 16
+  run_name: gtransformer-zinc
+
+zinc_autograph_transformer:
+  d_model: 32
+  n_layers: 2
+  n_heads: 4
+  d_ff: 16
+  run_name: autograph-zinc
+
+zinc_graphgps:
+  d_model: 64
+  n_layers: 4
+  n_heads: 4
+  hidden_dim: 32
+  mpnn_num_layers: 2
+  mpnn_hidden_dim: 32
+  run_name: graphgps-zinc
+

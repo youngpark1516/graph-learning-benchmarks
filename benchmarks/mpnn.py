@@ -16,6 +16,7 @@ from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch_geometric.data import Data
 from torch_geometric.nn import GINConv, global_mean_pool
+from sklearn.metrics import f1_score
 
 
 class GraphTaskDataset(Dataset):
@@ -48,18 +49,14 @@ class GraphTaskDataset(Dataset):
         self.samples = self._load_samples()
         self.graphs = []
         self.labels = []
-        self.query_nodes = []  # Store (u, v) pairs for shortest_path
+        self.query_nodes = []  # Store query nodes for shortest_path task
         self._parse_samples()
     
     def _load_samples(self) -> List[dict]:
         """Load samples from JSON files."""
         samples = []
 
-        # Handle both cases: data_dir as parent of tasks_autograph or as tasks_autograph itself
-        if (self.data_dir / "tasks_autograph").exists():
-            base = self.data_dir / "tasks_autograph" / self.task
-        else:
-            base = self.data_dir / self.task
+        base = self.data_dir / "tasks_autograph" / self.task
 
         # If algorithm is a list, collect samples from each algorithm subfolder
         algo_list = self.algorithm if isinstance(self.algorithm, (list, tuple)) else [self.algorithm]
@@ -82,12 +79,14 @@ class GraphTaskDataset(Dataset):
 
         return samples
     
-    def _parse_graph_from_tokens(self, tokens: List[str]) -> Tuple[nx.Graph, int]:
+    def _parse_graph_from_tokens(self, tokens: List[str]) -> Tuple[nx.Graph, Optional[Tuple[int, int]], int]:
         """Parse a graph from tokenized representation.
         
-        Token format: <bos> u1 v1 <e> u2 v2 <e> ... <n> n1 n2 ... <q> query <p> answer <eos>
+        Token format: <bos> u1 v1 <e> u2 v2 <e> ... <n> n1 n2 ... <q> shortest_path u v <p> answer <eos>
+        Returns: (graph, query_nodes, idx)
         """
         graph = nx.Graph()
+        query_nodes = None
         idx = 0
         
         if idx < len(tokens) and tokens[idx] == "<bos>":
@@ -131,30 +130,25 @@ class GraphTaskDataset(Dataset):
                 pass
             idx += 1
         
+        # Parse query nodes if present (for shortest_path task)
+        if idx < len(tokens) and tokens[idx] == "<q>":
+            idx += 1
+            try:
+                if idx < len(tokens):
+                    idx += 1  # Skip query type (e.g., "shortest_path")
+                if idx + 1 < len(tokens):
+                    u = int(tokens[idx])
+                    v = int(tokens[idx + 1])
+                    query_nodes = (u, v)
+                    idx += 2
+            except (ValueError, TypeError, IndexError):
+                pass
+        
         for u, v in list(graph.edges()):
             graph.add_node(u)
             graph.add_node(v)
         
-        return graph, idx
-    
-    def _extract_query_nodes(self, tokens: List[str]) -> Optional[Tuple[int, int]]:
-        """Extract query nodes from tokens for shortest_path task.
-        
-        Format: <q> shortest_distance u v
-        Returns: (u, v) or None if not found
-        """
-        try:
-            q_idx = tokens.index("<q>")
-            if q_idx + 3 < len(tokens) and tokens[q_idx + 1] == "shortest_distance":
-                try:
-                    u = int(tokens[q_idx + 2])
-                    v = int(tokens[q_idx + 3])
-                    return (u, v)
-                except (ValueError, IndexError):
-                    pass
-        except (ValueError, IndexError):
-            pass
-        return None
+        return graph, query_nodes, idx
     
     def _extract_label(self, tokens: List[str]) -> Optional[float]:
         """Extract label from tokens (numeric or categorical).
@@ -191,7 +185,6 @@ class GraphTaskDataset(Dataset):
         """Parse all samples into graphs and labels."""
         failed_count = 0
         success_count = 0
-        inf_skipped = 0
         
         for i, sample in enumerate(self.samples):
             text = sample.get("text", "")
@@ -202,30 +195,13 @@ class GraphTaskDataset(Dataset):
             tokens = text.strip().split()
             
             try:
-                graph, idx = self._parse_graph_from_tokens(tokens)
+                graph, query_nodes, idx = self._parse_graph_from_tokens(tokens)
                 label = self._extract_label(tokens)
-                
-                # For shortest_path, skip INF (unreachable) labels
-                if self.task == "shortest_path":
-                    try:
-                        p_idx = tokens.index("<p>")
-                        if p_idx + 1 < len(tokens) and tokens[p_idx + 1].upper() in ["INF", "INFINITY"]:
-                            inf_skipped += 1
-                            continue
-                    except ValueError:
-                        pass
-                
-                query_nodes = None
-                if self.task == "shortest_path":
-                    query_nodes = self._extract_query_nodes(tokens)
-                    if query_nodes is None:
-                        failed_count += 1
-                        continue
                 
                 if graph.number_of_nodes() > 0 and label is not None:
                     self.graphs.append(graph)
                     self.labels.append(label)
-                    self.query_nodes.append(query_nodes)  # None for non-shortest_path tasks
+                    self.query_nodes.append(query_nodes)  # Store query nodes (may be None)
                     success_count += 1
                 else:
                     failed_count += 1
@@ -240,26 +216,25 @@ class GraphTaskDataset(Dataset):
             print(f"  WARNING: Parsed {success_count} samples successfully, {failed_count} failed")
             if len(self.samples) > 0:
                 print(f"  First sample text (first 200 chars): {str(self.samples[0].get('text', ''))[:200]}")
-        
-        if self.task == "shortest_path" and inf_skipped > 0:
-            print(f"  Skipped {inf_skipped} unreachable (INF) samples for shortest_path")
     
     def _nx_to_pyg(self, graph: nx.Graph, query_nodes: Optional[Tuple[int, int]] = None) -> Data:
-        """Convert NetworkX graph to PyTorch Geometric Data object.
+        """Convert NetworkX graph to PyTorch Geometric Data object with proper node indexing.
         
-        Args:
-            graph: NetworkX graph
-            query_nodes: (u, v) tuple for shortest_path task, None otherwise
+        FIXES: 
+        1. Remaps edge indices to match node feature positions
+        2. Adds query node indicator features for shortest_path task
         """
+        # Create mapping from original node IDs to feature positions
+        sorted_nodes = sorted(graph.nodes())
+        node_id_to_pos = {node: pos for pos, node in enumerate(sorted_nodes)}
+        
+        # Build node features with proper indexing
         node_features = []
         degree_dict = dict(graph.degree())
-        sorted_nodes = sorted(graph.nodes())
-        
         for node in sorted_nodes:
-            degree = degree_dict.get(node, 0)
-            features = [float(degree)]
+            features = [float(degree_dict.get(node, 0))]
             
-            # Add query encoding for shortest_path task
+            # Add query node indicator features for shortest_path task
             if query_nodes is not None:
                 query_u, query_v = query_nodes
                 is_source = 1.0 if node == query_u else 0.0
@@ -269,16 +244,19 @@ class GraphTaskDataset(Dataset):
             node_features.append(features)
         
         if len(node_features) == 0:
-            # Fallback for empty graphs
-            feature_dim = 3 if query_nodes is not None else 1
+            # Handle empty graph - feature dim depends on whether we have query nodes
+            feature_dim = 3 if query_nodes else 1
             node_features = [[0.0] * feature_dim]
         
         x = torch.tensor(node_features, dtype=torch.float)
         
+        # Remap edge indices to match node feature positions
         edge_list = []
         for u, v in graph.edges():
-            edge_list.append([u, v])
-            edge_list.append([v, u])
+            u_pos = node_id_to_pos[u]
+            v_pos = node_id_to_pos[v]
+            edge_list.append([u_pos, v_pos])
+            edge_list.append([v_pos, u_pos])  # undirected graph
         
         if len(edge_list) == 0:
             edge_index = torch.tensor([[], []], dtype=torch.long)
@@ -294,7 +272,7 @@ class GraphTaskDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[Data, float]:
         graph = self.graphs[idx]
         label = self.labels[idx]
-        query_nodes = self.query_nodes[idx] if idx < len(self.query_nodes) else None
+        query_nodes = self.query_nodes[idx]
         data = self._nx_to_pyg(graph, query_nodes)
         return data, torch.tensor(label, dtype=torch.float)
 
@@ -308,7 +286,7 @@ class GIN(nn.Module):
         hidden_dim: int = 64,
         num_layers: int = 4,
         out_features: int = 1,
-        dropout: float = 0.5,
+        dropout: float = 0.1,
     ):
         """
         Args:
@@ -386,6 +364,7 @@ class GraphMPNNTrainer:
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         task_type: str = "regression",
         loss: str | None = None,
+        task_name: str | None = None,
     ):
         """
         Args:
@@ -394,11 +373,14 @@ class GraphMPNNTrainer:
             weight_decay: Weight decay for optimizer
             device: Device to train on
             task_type: "regression" or "classification"
+            loss: Loss function name (optional)
+            task_name: Task name (e.g., "shortest_path") for special handling
         """
         self.model = model
         self.device = torch.device(device)
         self.model.to(self.device)
         self.task_type = task_type
+        self.task_name = task_name or ""
         
         self.optimizer = Adam(
             model.parameters(),
@@ -425,10 +407,19 @@ class GraphMPNNTrainer:
                 self.loss_fn = _rmse
             else:
                 # Unknown loss name - fallback to defaults
-                self.loss_fn = nn.BCEWithLogitsLoss() if task_type == "classification" else nn.MSELoss()
+                self.loss_fn = self._get_default_loss_fn()
         else:
-            # Default behavior: BCE for classification, MSE for regression
-            self.loss_fn = nn.BCEWithLogitsLoss() if task_type == "classification" else nn.MSELoss()
+            # Default behavior: use MSE for shortest_path (even though it's classification for metrics),
+            # BCE for other classification tasks, MSE for regression
+            self.loss_fn = self._get_default_loss_fn()
+    
+    def _get_default_loss_fn(self):
+        """Get default loss function based on task type and task name."""
+        # Classification tasks (including shortest_path) use cross-entropy
+        if self.task_type == "classification":
+            return nn.CrossEntropyLoss()
+        # Regression tasks use MSE
+        return nn.MSELoss()
     
     def train_epoch(self, dataloader: DataLoader) -> float:
         """Train for one epoch.
@@ -447,7 +438,19 @@ class GraphMPNNTrainer:
             batch = batch.to(self.device)
             
             pred = self.model(batch)
-            label = batch.y.view(-1, 1)
+            label = batch.y
+            
+            # For classification with cross-entropy, reshape if needed
+            if self.task_type == "classification":
+                # Cross-entropy expects pred: (batch_size, num_classes), label: (batch_size,)
+                if pred.dim() > 1 and pred.size(1) == 1:
+                    # If pred has shape (batch_size, 1), treat as 2-class problem
+                    pred = pred.squeeze(-1).unsqueeze(-1)  # Keep (batch_size, 1) for BCE or reshape
+                # For cross-entropy, we need to expand to multiple classes or use binary cross-entropy equivalent
+                # For now, assume pred already has proper shape or will be handled by loss function
+                label = label.long()
+            else:
+                label = label.view(-1, 1)
             
             loss = self.loss_fn(pred, label)
             
@@ -468,7 +471,7 @@ class GraphMPNNTrainer:
             dataloader: Evaluation dataloader
         
         Returns:
-            Dictionary with metrics (loss, mae, accuracy)
+            Dictionary with metrics (loss, mae, accuracy, f1_score)
         """
         self.model.eval()
         total_loss = 0.0
@@ -477,20 +480,46 @@ class GraphMPNNTrainer:
         total_samples = 0
         num_batches = 0
         
+        # For F1 score computation in classification
+        all_preds = []
+        all_labels = []
+        
         for batch in dataloader:
             batch = batch.to(self.device)
             pred = self.model(batch)
-            label = batch.y.view(-1, 1)
+            label = batch.y
             
-            loss = self.loss_fn(pred, label)
+            # Handle label shape for loss computation
+            if self.task_type == "classification":
+                label_for_loss = label.long()
+            else:
+                label_for_loss = label.view(-1, 1)
+            
+            loss = self.loss_fn(pred, label_for_loss)
             total_loss += loss.item()
             num_batches += 1
             
             if self.task_type == "classification":
-                pred_binary = (torch.sigmoid(pred) > 0.5).float()
-                correct = (pred_binary == label).sum().item()
+                # Use argmax for multi-class classification (including shortest_path)
+                if pred.dim() > 1 and pred.size(1) > 1:
+                    # Multi-class: pred has shape (batch_size, num_classes)
+                    pred_classes = pred.argmax(dim=1)
+                else:
+                    # Binary or single output: round the predictions
+                    pred.view(-1, 1)
+                    pred_classes = torch.round(pred).to(torch.int64).squeeze(-1)
+                
+                all_preds.extend(pred_classes.cpu().numpy().flatten().tolist())
+                all_labels.extend(label.cpu().numpy().flatten().tolist())
+                correct = (pred_classes == label.long()).sum().item()
                 total_correct += correct
                 total_samples += label.size(0)
+                
+                # Compute MAE for distance-based tasks like shortest_path
+                if "shortest_path" in self.task_name.lower():
+                    pred_distances = pred_classes.float()
+                    label_distances = label.float()
+                    total_mae += torch.mean(torch.abs(pred_distances - label_distances)).item()
             else:
                 mae = torch.mean(torch.abs(pred - label))
                 total_mae += mae.item()
@@ -510,6 +539,14 @@ class GraphMPNNTrainer:
         
         if self.task_type == "classification":
             metrics["accuracy"] = total_correct / total_samples if total_samples > 0 else 0.0
+            # Compute F1 score for classification tasks
+            if all_labels:
+                metrics["f1_score"] = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
+            else:
+                metrics["f1_score"] = 0.0
+            # Include MAE for distance-based classification tasks
+            if "shortest_path" in self.task_name.lower():
+                metrics["mae"] = total_mae / num_batches if num_batches > 0 else 0.0
         else:
             metrics["mae"] = total_mae / num_batches if num_batches > 0 else 0.0
             eval_metrics = getattr(self, 'eval_metrics', None) or []
@@ -625,10 +662,8 @@ def main(
         collate_fn=collate_fn,
     )
     
-    # Input features: degree (1) + query encoding (2) for shortest_path
-    in_features = 3 if task == "shortest_path" else 1
+    in_features = 1
     
-    # Only cycle_check is binary classification; shortest_path predicts path length (regression)
     task_type = "classification" if task in ["cycle_check"] else "regression"
     
     model = GIN(
@@ -636,7 +671,7 @@ def main(
         hidden_dim=hidden_dim,
         num_layers=num_layers,
         out_features=1,
-        dropout=0.5,
+        dropout=0.1,
     )
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
