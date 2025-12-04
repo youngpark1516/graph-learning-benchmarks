@@ -40,8 +40,8 @@ def train_transformer_epoch(model, dataloader, optimizer, device, loss_name: str
 
 
 @torch.no_grad()
-def eval_transformer_epoch(model, dataloader, device, loss_name: str | None = None):
-    return tu_eval_transformer_epoch(model, dataloader, device, loss_name=loss_name)
+def eval_transformer_epoch(model, dataloader, device, loss_name: str | None = None, task_name: str = ""):
+    return tu_eval_transformer_epoch(model, dataloader, device, loss_name=loss_name, task_name=task_name)
 
 
 def main():
@@ -456,12 +456,22 @@ def main():
                     epoch_start = time.time()
                     
                     train_loss, train_acc, train_f1 = train_transformer_epoch(model, train_loader, optimizer, device, loss_name=getattr(model_args, 'loss', None))
-                    valid_loss, valid_acc, valid_f1 = eval_transformer_epoch(model, valid_loader, device, loss_name=getattr(model_args, 'loss', None))
+                    valid_result = eval_transformer_epoch(model, valid_loader, device, loss_name=getattr(model_args, 'loss', None), task_name=model_args.task)
+                    
+                    # Handle variable return values (with/without MAE)
+                    if len(valid_result) == 4:
+                        valid_loss, valid_acc, valid_f1, valid_mae = valid_result
+                    else:
+                        valid_loss, valid_acc, valid_f1 = valid_result
+                        valid_mae = None
+                    
                     scheduler.step()
 
                     # Build standardized metric dicts for transformer
                     train_metrics = {"loss": train_loss, "accuracy": train_acc, "f1_score": train_f1}
                     valid_metrics = {"loss": valid_loss, "accuracy": valid_acc, "f1_score": valid_f1}
+                    if valid_mae is not None:
+                        valid_metrics["mae"] = valid_mae
 
                     logd = _make_standard_log(epoch, model_name, "classification", train_metrics, valid_metrics, eval_metrics=getattr(model_args, 'eval_metrics', None))
                     
@@ -481,8 +491,16 @@ def main():
                     model.load_state_dict(torch.load(str(best_path)))
                     test_loader = v.get("test_loader")
                     if test_loader is not None:
-                        test_loss, test_acc, test_f1 = eval_transformer_epoch(model, test_loader, device)
+                        test_result = eval_transformer_epoch(model, test_loader, device, task_name=model_args.task)
+                        if len(test_result) == 4:
+                            test_loss, test_acc, test_f1, test_mae = test_result
+                        else:
+                            test_loss, test_acc, test_f1 = test_result
+                            test_mae = None
+                        
                         test_metrics = {"loss": test_loss, "accuracy": test_acc, "f1_score": test_f1}
+                        if test_mae is not None:
+                            test_metrics["mae"] = test_mae
                         wandb.log(_make_standard_test_log(model_name, "classification", test_metrics, eval_metrics=getattr(model_args, 'eval_metrics', None)))
                 except Exception:
                     # If loading or evaluation fails, log nothing but continue

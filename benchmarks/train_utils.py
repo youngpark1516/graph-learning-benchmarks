@@ -78,10 +78,11 @@ def train_transformer_epoch(model, dataloader, optimizer, device, loss_name: str
 
 
 @torch.no_grad()
-def eval_transformer_epoch(model, dataloader, device, loss_name: str | None = None):
+def eval_transformer_epoch(model, dataloader, device, loss_name: str | None = None, task_name: str = ""):
     model.eval()
     total_loss = 0.0
     total_correct = 0
+    total_mae = 0.0
     total_count = 0
     all_preds = []
     all_labels = []
@@ -105,10 +106,20 @@ def eval_transformer_epoch(model, dataloader, device, loss_name: str | None = No
         total_count += bsz
         all_preds.extend(preds.cpu().numpy())
         all_labels.extend(labels.cpu().numpy())
+        
+        # Compute MAE for distance-based tasks like shortest_path
+        if "shortest_path" in task_name.lower():
+            pred_distances = preds.float()
+            label_distances = labels.float()
+            total_mae += torch.mean(torch.abs(pred_distances - label_distances)).item() * bsz
 
     avg_loss = total_loss / total_count if total_count > 0 else float('nan')
     acc = total_correct / total_count if total_count > 0 else float('nan')
     f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0) if len(all_labels) > 0 else 0.0
+    mae = total_mae / total_count if total_count > 0 else 0.0
+    # Return MAE for shortest_path tasks
+    if "shortest_path" in task_name.lower():
+        return avg_loss, acc, f1, mae
     return avg_loss, acc, f1
 
 

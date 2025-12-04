@@ -118,10 +118,8 @@ class ZINCLoader:
             PyG-compatible dataset
         """
         zinc_ds = ZINCDataset(root=root, split=split, subset=subset)
-        if return_tuple:
-            return zinc_ds
-        else:
-            return ZINCGraphDataset(zinc_ds, return_tuple=False)
+        # Always wrap with ZINCGraphDataset to apply one-hot encoding
+        return ZINCGraphDataset(zinc_ds, return_tuple=return_tuple)
     
     @staticmethod
     def load_tokenized_data(
@@ -556,9 +554,18 @@ class ZINCGraphDataset(Dataset):
         """Get sample - either as tuple or with y attached to Data."""
         data = self.zinc_dataset.pyg_dataset[idx]
         
-        # Convert node features to float
+        # Convert node features to one-hot encoding
         if hasattr(data, 'x') and data.x is not None:
-            data.x = data.x.float()
+            # Node features are [num_nodes, 1] with atomic numbers 0-118
+            # Convert to one-hot: [num_nodes, 119]
+            atomic_nums = data.x.squeeze(-1).long()  # [num_nodes]
+            num_nodes = atomic_nums.shape[0]
+            
+            # Create one-hot encoding with 119 dimensions (atomic numbers 0-118)
+            one_hot = torch.zeros(num_nodes, 119, dtype=torch.float32, device=data.x.device)
+            one_hot.scatter_(1, atomic_nums.unsqueeze(1), 1.0)
+            
+            data.x = one_hot
         
         label = data.y if hasattr(data, 'y') and data.y is not None else 0.0
         

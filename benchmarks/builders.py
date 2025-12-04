@@ -83,6 +83,7 @@ def build_mpnn(args, device):
     out_features = 1
     if task_type == "classification":
         try:
+            import math
             labels = []
             base_train = train_dataset.dataset if hasattr(train_dataset, 'dataset') else train_dataset
             # Sample labels comprehensively
@@ -90,13 +91,17 @@ def build_mpnn(args, device):
             for i in range(sample_size):
                 try:
                     _, label = base_train[i]
-                    labels.append(int(label))
+                    label_val = float(label)
+                    # Skip infinity labels (unreachable nodes) - will be mapped to separate class
+                    if not math.isinf(label_val):
+                        labels.append(int(label_val))
                 except Exception:
                     pass
             if labels:
                 # For distance-based tasks like shortest_path, use max label + 1 as num_classes
+                # Add 1 extra class for infinity/unreachable nodes
                 max_label = max(labels)
-                num_classes = max_label + 1
+                num_classes = max_label + 1 + 1  # +1 for unreachable class
                 out_features = max(2, num_classes)
             else:
                 out_features = 2
@@ -104,7 +109,7 @@ def build_mpnn(args, device):
             print(f"Warning: Could not determine number of classes: {e}")
             out_features = 2
     
-    model = GIN(in_features=in_features, hidden_dim=args.hidden_dim, num_layers=args.num_layers, out_features=out_features, dropout=0.5)
+    model = GIN(in_features=in_features, hidden_dim=args.hidden_dim, num_layers=args.num_layers, out_features=out_features, dropout=0.1)
     
     # Print model architecture
     total_params = sum(p.numel() for p in model.parameters())
@@ -389,7 +394,7 @@ def build_mpnn_zinc(args, device):
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
     
     # ZINC logp is regression task
-    model = GIN(in_features=1, hidden_dim=args.hidden_dim, num_layers=args.num_layers, out_features=1, dropout=0.5)
+    model = GIN(in_features=1, hidden_dim=args.hidden_dim, num_layers=args.num_layers, out_features=1, dropout=0.1)
     trainer = GraphMPNNTrainer(
         model,
         learning_rate=args.learning_rate,
@@ -669,7 +674,11 @@ def build_zinc_mpnn(args, device):
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
     
     # Get feature dimension from first sample
-    sample = train_dataset[0]
+    sample_item = train_dataset[0]
+    if isinstance(sample_item, tuple):
+        sample, _ = sample_item  # Unpack (data, label) tuple
+    else:
+        sample = sample_item
     in_features = sample.x.shape[1] if hasattr(sample, 'x') and sample.x is not None else 1
     
     # Build GIN model for regression
@@ -678,7 +687,7 @@ def build_zinc_mpnn(args, device):
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         out_features=1,  # Regression: single output
-        dropout=0.5
+        dropout=0.1,
     )
     
     # Print model info

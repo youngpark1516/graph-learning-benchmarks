@@ -256,10 +256,11 @@ def train_epoch(model, dataloader, optimizer, device) -> tuple[float, float]:
     return avg_loss, acc
 
 
-def eval_epoch(model, dataloader, device) -> tuple[float, float]:
+def eval_epoch(model, dataloader, device, task_name: str = "") -> tuple[float, float, float]:
     model.eval()
     total_loss = 0.0
     total_correct = 0
+    total_mae = 0.0
     total_count = 0
 
     with torch.no_grad():
@@ -280,10 +281,17 @@ def eval_epoch(model, dataloader, device) -> tuple[float, float]:
             preds = logits_at_p.argmax(dim=-1)
             total_correct += (preds == labels).sum().item()
             total_count += bsz
+            
+            # Compute MAE for distance-based tasks like shortest_path
+            if "shortest_path" in task_name.lower():
+                pred_distances = preds.float()
+                label_distances = labels.float()
+                total_mae += torch.mean(torch.abs(pred_distances - label_distances)).item() * bsz
 
     avg_loss = total_loss / total_count if total_count > 0 else float('nan')
     acc = total_correct / total_count if total_count > 0 else float('nan')
-    return avg_loss, acc
+    mae = total_mae / total_count if total_count > 0 else 0.0
+    return avg_loss, acc, mae
 
 
 def main():

@@ -289,6 +289,7 @@ def build_graphgps(args, device: str):
     out_dim = 1
     if task_type == "classification":
         try:
+            import math
             labels = []
             base_train = train_dataset.dataset if hasattr(train_dataset, 'dataset') else train_dataset
             # Sample labels comprehensively - check entire dataset if small, otherwise sample more
@@ -296,13 +297,17 @@ def build_graphgps(args, device: str):
             for i in range(sample_size):
                 try:
                     _, label = base_train[i]
-                    labels.append(int(label))
+                    label_val = float(label)
+                    # Skip infinity labels (unreachable nodes) - will be mapped to separate class
+                    if not math.isinf(label_val):
+                        labels.append(int(label_val))
                 except Exception:
                     pass
             if labels:
                 # For distance-based tasks like shortest_path, use max label + 1 as num_classes
+                # Add 1 extra class for infinity/unreachable nodes
                 max_label = max(labels)
-                num_classes = max_label + 1
+                num_classes = max_label + 1 + 1  # +1 for unreachable class
                 out_dim = max(2, num_classes)
             else:
                 out_dim = 2
@@ -388,6 +393,7 @@ def build_graphgps(args, device: str):
             return nn.MSELoss()
 
         def train_epoch(self, loader: DataLoader) -> float:
+            import math
             self.model.train()
             total = 0.0
             n = 0
@@ -398,7 +404,18 @@ def build_graphgps(args, device: str):
                 
                 # Handle label shape for loss computation
                 if self.task_type == "classification":
-                    label_for_loss = label.long()
+                    # Map infinity labels to a reserved class (highest class index)
+                    max_label = int(pred.size(1) - 1)  # Use model's output dim - 1
+                    
+                    # Create a new label tensor with infinity mapped to max class
+                    label_new = []
+                    for l in label:
+                        l_val = float(l.item())
+                        if math.isinf(l_val):
+                            label_new.append(max_label)
+                        else:
+                            label_new.append(int(l_val))
+                    label_for_loss = torch.tensor(label_new, dtype=torch.long, device=self.device)
                 else:
                     label_for_loss = label.view(-1, 1)
                 
@@ -412,6 +429,7 @@ def build_graphgps(args, device: str):
 
         @torch.no_grad()
         def evaluate(self, loader: DataLoader) -> Dict[str, float]:
+            import math
             self.model.eval()
             total = 0.0
             total_mae = 0.0
@@ -430,7 +448,16 @@ def build_graphgps(args, device: str):
                 
                 # Handle label shape for loss computation
                 if self.task_type == "classification":
-                    label_for_loss = label.long()
+                    # Map infinity labels to a reserved class (highest class index)
+                    max_label = int(pred.size(1) - 1)  # Use model's output dim - 1
+                    label_new = []
+                    for l in label:
+                        l_val = float(l.item())
+                        if math.isinf(l_val):
+                            label_new.append(max_label)
+                        else:
+                            label_new.append(int(l_val))
+                    label_for_loss = torch.tensor(label_new, dtype=torch.long, device=self.device)
                 else:
                     label_for_loss = label.view(-1, 1)
                 
@@ -447,9 +474,19 @@ def build_graphgps(args, device: str):
                         pred_classes = torch.round(pred).to(torch.int64).squeeze(-1)
                     
                     all_preds.extend(pred_classes.cpu().numpy().flatten().tolist())
-                    all_labels.extend(label.cpu().numpy().flatten().tolist())
-                    correct += (pred_classes == label.long()).sum().item()
+                    all_labels.extend(label_for_loss.cpu().numpy().flatten().tolist())
+                    correct += (pred_classes == label_for_loss).sum().item()
                     samples += label.size(0)
+                    
+                    # Compute MAE for distance-based tasks like shortest_path
+                    # Convert predictions and labels back to distance values
+                    if "shortest_path" in self.task_name.lower():
+                        # pred_classes are indices 0-7, but distance values are 1-7 (or max_label for unreachable)
+                        # Map back to original distances: class 1->distance 1, class 2->distance 2, etc.
+                        # For shortest path, class i typically corresponds to distance i
+                        pred_distances = pred_classes.float()
+                        label_distances = label_for_loss.float()
+                        total_mae += torch.mean(torch.abs(pred_distances - label_distances)).item()
                 else:
                         total_mae += torch.mean(torch.abs(pred - label.view(-1, 1))).item()
                         # If caller requested accuracy for regression tasks, compute it
@@ -468,6 +505,9 @@ def build_graphgps(args, device: str):
                     metrics["f1_score"] = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
                 else:
                     metrics["f1_score"] = 0.0
+                # Include MAE for distance-based classification tasks like shortest_path
+                if "shortest_path" in self.task_name.lower() and total_mae > 0:
+                    metrics["mae"] = total_mae / n if n > 0 else float('nan')
             else:
                 metrics["mae"] = total_mae / n if n > 0 else float('nan')
                 # If accuracy was requested for regression tasks, include it

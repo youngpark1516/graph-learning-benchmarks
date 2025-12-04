@@ -514,6 +514,12 @@ class GraphMPNNTrainer:
                 correct = (pred_classes == label.long()).sum().item()
                 total_correct += correct
                 total_samples += label.size(0)
+                
+                # Compute MAE for distance-based tasks like shortest_path
+                if "shortest_path" in self.task_name.lower():
+                    pred_distances = pred_classes.float()
+                    label_distances = label.float()
+                    total_mae += torch.mean(torch.abs(pred_distances - label_distances)).item()
             else:
                 mae = torch.mean(torch.abs(pred - label))
                 total_mae += mae.item()
@@ -538,6 +544,9 @@ class GraphMPNNTrainer:
                 metrics["f1_score"] = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
             else:
                 metrics["f1_score"] = 0.0
+            # Include MAE for distance-based classification tasks
+            if "shortest_path" in self.task_name.lower():
+                metrics["mae"] = total_mae / num_batches if num_batches > 0 else 0.0
         else:
             metrics["mae"] = total_mae / num_batches if num_batches > 0 else 0.0
             eval_metrics = getattr(self, 'eval_metrics', None) or []
