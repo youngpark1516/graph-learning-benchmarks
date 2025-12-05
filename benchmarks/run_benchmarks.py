@@ -70,6 +70,11 @@ def main():
     parser.add_argument("--test_algorithm", type=str, default=None, help="Override algorithm for test dataset (default: use same as --algorithm)")
     parser.add_argument("--test_algorithms", type=str, default=None, help="Comma-separated list of algorithms for test set (overrides --test_algorithm)")
     
+    # AutoGraph-specific arguments for ZINC
+    parser.add_argument("--use_autograph_with_features", action="store_true", help="For AutoGraph on ZINC: use trail + node features (default: topology-only)")
+    parser.add_argument("--use_autograph_interspersed", action="store_true", help="For AutoGraph on ZINC: intersperse atom types after each node in trail")
+    parser.add_argument("--use_autograph_interleaved_edges", action="store_true", help="For AutoGraph on ZINC: intersperse both atoms and bonds into trail")
+    
     # GraphGPS-specific arguments for positional encoding and normalization
     parser.add_argument("--use_lap_pe", action="store_true", help="Enable Laplacian Positional Encoding for GraphGPS")
     parser.add_argument("--lap_pe_dim", type=int, default=16, help="Dimension of Laplacian PE (default: 16)")
@@ -106,6 +111,9 @@ def main():
         "use_lap_pe": False,
         "lap_pe_dim": 16,
         "norm_type": "batch",
+        "use_autograph_with_features": False,
+        "use_autograph_interspersed": False,
+        "use_autograph_interleaved_edges": False,
     }
 
     # Auto-discover model config if not explicitly provided. Prefer YAML.
@@ -243,7 +251,10 @@ def main():
                 elif model_name == "graphgps":
                     v = build_zinc_graphgps(model_args, device)
                 else:
-                    v = build_zinc_transformer(model_args, device, model_name)
+                    use_features = getattr(model_args, 'use_autograph_with_features', False)
+                    use_interspersed = getattr(model_args, 'use_autograph_interspersed', False)
+                    use_interleaved_edges = getattr(model_args, 'use_autograph_interleaved_edges', False)
+                    v = build_zinc_transformer(model_args, device, model_name, use_autograph_with_features=use_features, use_autograph_interspersed=use_interspersed, use_autograph_interleaved_edges=use_interleaved_edges)
                 
                 # ZINC uses trainer-based models (MPNN, GraphGPS) or direct models (Transformers)
                 if "trainer" in v:

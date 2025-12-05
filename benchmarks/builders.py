@@ -721,7 +721,9 @@ def build_zinc_mpnn(args, device):
     }
 
 
-def build_zinc_transformer(args, device, which="graph_transformer", use_autograph: bool = False):
+def build_zinc_transformer(args, device, which="graph_transformer", use_autograph: bool = False, 
+                           use_autograph_with_features: bool = False, use_autograph_interspersed: bool = False,
+                           use_autograph_interleaved_edges: bool = False):
     """Build Transformer for ZINC molecular property prediction.
     
     Tokenizes molecular graphs for transformer processing.
@@ -730,7 +732,10 @@ def build_zinc_transformer(args, device, which="graph_transformer", use_autograp
         args: Configuration arguments
         device: Torch device (cuda or cpu)
         which: Model type identifier
-        use_autograph: If True, use AutoGraph's trail-based tokenization
+        use_autograph: If True, use AutoGraph's trail-based tokenization (topology only)
+        use_autograph_with_features: If True, use AutoGraph's trail with node features appended
+        use_autograph_interspersed: If True, use AutoGraph's trail with atoms interspersed after nodes
+        use_autograph_interleaved_edges: If True, use AutoGraph's trail with atoms and bonds interleaved
     """
     from zinc_dataset import ZINCLoader
     from graph_transformer import GraphTransformer as Transformer
@@ -745,6 +750,9 @@ def build_zinc_transformer(args, device, which="graph_transformer", use_autograp
         subset=subset,
         max_seq_len=args.max_seq_length,
         use_autograph=use_autograph,
+        use_autograph_with_features=use_autograph_with_features,
+        use_autograph_interspersed=use_autograph_interspersed,
+        use_autograph_interleaved_edges=use_autograph_interleaved_edges,
         random_seed=getattr(args, 'random_seed', 1234)
     )
     valid_dataset = ZINCLoader.load_tokenized_data(
@@ -753,6 +761,9 @@ def build_zinc_transformer(args, device, which="graph_transformer", use_autograp
         subset=subset,
         max_seq_len=args.max_seq_length,
         use_autograph=use_autograph,
+        use_autograph_with_features=use_autograph_with_features,
+        use_autograph_interspersed=use_autograph_interspersed,
+        use_autograph_interleaved_edges=use_autograph_interleaved_edges,
         random_seed=getattr(args, 'random_seed', 1235)
     )
     test_dataset = ZINCLoader.load_tokenized_data(
@@ -761,6 +772,9 @@ def build_zinc_transformer(args, device, which="graph_transformer", use_autograp
         subset=subset,
         max_seq_len=args.max_seq_length,
         use_autograph=use_autograph,
+        use_autograph_with_features=use_autograph_with_features,
+        use_autograph_interspersed=use_autograph_interspersed,
+        use_autograph_interleaved_edges=use_autograph_interleaved_edges,
         random_seed=getattr(args, 'random_seed', 1236)
     )
     
@@ -777,8 +791,11 @@ def build_zinc_transformer(args, device, which="graph_transformer", use_autograp
     valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
     
-    # Get vocab size
-    vocab_size = len(train_dataset.token2idx) if hasattr(train_dataset, 'token2idx') else 200
+    # Get vocab size (need to account for highest token ID, not just dict length)
+    if hasattr(train_dataset, 'token2idx'):
+        vocab_size = max(train_dataset.token2idx.values()) + 1
+    else:
+        vocab_size = 200
     
     # Build transformer for regression
     # Wrap Transformer for regression: use mean pooling of hidden states -> linear layer
@@ -826,7 +843,16 @@ def build_zinc_transformer(args, device, which="graph_transformer", use_autograp
     # Print model info
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    tokenizer_type = "AutoGraph" if use_autograph else "Simple"
+    if use_autograph_interleaved_edges:
+        tokenizer_type = "AutoGraph+Interleaved(Atoms+Bonds)"
+    elif use_autograph_interspersed:
+        tokenizer_type = "AutoGraph+Interspersed"
+    elif use_autograph_with_features:
+        tokenizer_type = "AutoGraph+Features"
+    elif use_autograph:
+        tokenizer_type = "AutoGraph"
+    else:
+        tokenizer_type = "Simple"
     print(f"\n{'='*70}")
     print(f"[ZINC {which.upper()}] Model Architecture (Tokenizer: {tokenizer_type})")
     print(f"{'='*70}")

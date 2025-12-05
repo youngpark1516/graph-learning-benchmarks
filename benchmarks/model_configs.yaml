@@ -47,25 +47,36 @@ zinc_mpnn:
   run_name: mpnn-zinc
 
 zinc_graph_transformer:
-  d_model: 32
-  n_layers: 2
+  d_model: 64
+  n_layers: 4
   n_heads: 4
-  d_ff: 16
+  d_ff: 64
+  max_sequence_length: 256
   run_name: gtransformer-zinc
 
 zinc_autograph_transformer:
-  d_model: 32
-  n_layers: 2
+  d_model: 64
+  n_layers: 4
   n_heads: 4
-  d_ff: 16
+  d_ff: 64
   run_name: autograph-zinc
+
+# light version
+# zinc_graphgps:
+#   d_model: 32
+#   n_layers: 4
+#   n_heads: 4
+#   hidden_dim: 32
+#   mpnn_num_layers: 3
+#   mpnn_hidden_dim: 32
+#   run_name: graphgps-zinc
 
 zinc_graphgps:
   d_model: 64
   n_layers: 4
   n_heads: 4
-  hidden_dim: 32
-  mpnn_num_layers: 2
-  mpnn_hidden_dim: 32
+  hidden_dim: 64
+  mpnn_num_layers: 4
+  mpnn_hidden_dim: 64
   run_name: graphgps-zinc
 
