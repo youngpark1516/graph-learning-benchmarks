@@ -16,7 +16,6 @@ def _make_loss_fn_for_transformer(loss_name: str | None):
         return lambda logits, labels: torch.mean(torch.abs(logits - torch.nn.functional.one_hot(labels, num_classes=logits.size(-1)).float()))
     if ln in ("rmse",):
         return lambda logits, labels: torch.sqrt(torch.mean((logits - torch.nn.functional.one_hot(labels, num_classes=logits.size(-1)).float()).pow(2)) + 1e-8)
-    # default to cross-entropy for transformer classification
     return lambda logits, labels: torch.nn.functional.cross_entropy(logits, labels)
 
 
@@ -30,10 +29,8 @@ def _make_loss_fn_for_regression(loss_name: str | None):
     if ln in ("mse", "mse_loss"):
         return torch.nn.MSELoss()
     if ln in ("rmse",):
-        # RMSE = sqrt(MSE), but we use MSE for loss and sqrt it for metrics
         return torch.nn.MSELoss()
-    # default to L1 (MAE) for regression
-    return torch.nn.L1Loss()
+        return torch.nn.L1Loss()
 
 
 def train_transformer_epoch(model, dataloader, optimizer, device, loss_name: str | None = None):
@@ -49,12 +46,8 @@ def train_transformer_epoch(model, dataloader, optimizer, device, loss_name: str
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["label"].to(device)
 
-        logits = model(input_ids, attention_mask)  # (B, S, V)
-        lengths = attention_mask.long().sum(dim=1)
-        # pick the token position for the predicted answer.
-        # many of our examples end with `<answer> <eos>`, so the answer
-        # token is the second-to-last non-padded token. Clamp to 0
-        # to avoid negative indices for very short sequences.
+        logits = model(input_ids, attention_mask)  # (B, S, output_dim)
+        lengths = attention_mask.long().sum(dim=1)  # (B,)
         p_pos = (lengths - 2).clamp(min=0)
         bsz = input_ids.size(0)
         logits_at_p = logits[torch.arange(bsz, device=device), p_pos, :]
@@ -94,7 +87,6 @@ def eval_transformer_epoch(model, dataloader, device, loss_name: str | None = No
 
         logits = model(input_ids, attention_mask)
         lengths = attention_mask.long().sum(dim=1)
-        # see comment in training loop: use second-to-last token as answer
         p_pos = (lengths - 2).clamp(min=0)
         bsz = input_ids.size(0)
         logits_at_p = logits[torch.arange(bsz, device=device), p_pos, :]

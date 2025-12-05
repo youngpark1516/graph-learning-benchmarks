@@ -1,5 +1,3 @@
-"""GIN MPNN model for graph-level prediction tasks using PyTorch Geometric."""
-
 import argparse
 import json
 from pathlib import Path
@@ -49,7 +47,7 @@ class GraphTaskDataset(Dataset):
         self.samples = self._load_samples()
         self.graphs = []
         self.labels = []
-        self.query_nodes = []  # Store query nodes for shortest_path task
+        self.query_nodes = []
         self._parse_samples()
     
     def _load_samples(self) -> List[dict]:
@@ -58,7 +56,6 @@ class GraphTaskDataset(Dataset):
 
         base = self.data_dir / "tasks_autograph" / self.task
 
-        # If algorithm is a list, collect samples from each algorithm subfolder
         algo_list = self.algorithm if isinstance(self.algorithm, (list, tuple)) else [self.algorithm]
 
         found_any = False
@@ -130,12 +127,12 @@ class GraphTaskDataset(Dataset):
                 pass
             idx += 1
         
-        # Parse query nodes if present (for shortest_path task)
+        # Parse query nodes if present
         if idx < len(tokens) and tokens[idx] == "<q>":
             idx += 1
             try:
                 if idx < len(tokens):
-                    idx += 1  # Skip query type (e.g., "shortest_path")
+                    idx += 1
                 if idx + 1 < len(tokens):
                     u = int(tokens[idx])
                     v = int(tokens[idx + 1])
@@ -201,7 +198,7 @@ class GraphTaskDataset(Dataset):
                 if graph.number_of_nodes() > 0 and label is not None:
                     self.graphs.append(graph)
                     self.labels.append(label)
-                    self.query_nodes.append(query_nodes)  # Store query nodes (may be None)
+                    self.query_nodes.append(query_nodes)
                     success_count += 1
                 else:
                     failed_count += 1
@@ -244,7 +241,7 @@ class GraphTaskDataset(Dataset):
             node_features.append(features)
         
         if len(node_features) == 0:
-            # Handle empty graph - feature dim depends on whether we have query nodes
+            # Handle empty graph
             feature_dim = 3 if query_nodes else 1
             node_features = [[0.0] * feature_dim]
         
@@ -388,8 +385,6 @@ class GraphMPNNTrainer:
             weight_decay=weight_decay,
         )
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=100)
-        # Allow caller to select loss function. If loss is None, fall back
-        # to sensible defaults per task_type.
         self.loss_name = (loss or "").lower() if loss is not None else None
         if self.loss_name:
             if self.loss_name in ("bce", "bcewithlogits", "bce_with_logits"):
@@ -399,26 +394,20 @@ class GraphMPNNTrainer:
             elif self.loss_name in ("mae", "l1", "l1loss"):
                 self.loss_fn = nn.L1Loss()
             elif self.loss_name in ("rmse",):
-                # RMSE training: take sqrt of MSE (add eps for numerical stability)
                 def _rmse(pred, target):
                     mse = nn.MSELoss()(pred, target)
                     return torch.sqrt(mse + 1e-8)
 
                 self.loss_fn = _rmse
             else:
-                # Unknown loss name - fallback to defaults
                 self.loss_fn = self._get_default_loss_fn()
         else:
-            # Default behavior: use MSE for shortest_path (even though it's classification for metrics),
-            # BCE for other classification tasks, MSE for regression
             self.loss_fn = self._get_default_loss_fn()
     
     def _get_default_loss_fn(self):
         """Get default loss function based on task type and task name."""
-        # Classification tasks (including shortest_path) use cross-entropy
         if self.task_type == "classification":
             return nn.CrossEntropyLoss()
-        # Regression tasks use MSE
         return nn.MSELoss()
     
     def train_epoch(self, dataloader: DataLoader) -> float:
@@ -440,14 +429,9 @@ class GraphMPNNTrainer:
             pred = self.model(batch)
             label = batch.y
             
-            # For classification with cross-entropy, reshape if needed
             if self.task_type == "classification":
-                # Cross-entropy expects pred: (batch_size, num_classes), label: (batch_size,)
                 if pred.dim() > 1 and pred.size(1) == 1:
-                    # If pred has shape (batch_size, 1), treat as 2-class problem
-                    pred = pred.squeeze(-1).unsqueeze(-1)  # Keep (batch_size, 1) for BCE or reshape
-                # For cross-entropy, we need to expand to multiple classes or use binary cross-entropy equivalent
-                # For now, assume pred already has proper shape or will be handled by loss function
+                    pred = pred.squeeze(-1).unsqueeze(-1)
                 label = label.long()
             else:
                 label = label.view(-1, 1)
@@ -480,7 +464,6 @@ class GraphMPNNTrainer:
         total_samples = 0
         num_batches = 0
         
-        # For F1 score computation in classification
         all_preds = []
         all_labels = []
         
@@ -489,7 +472,6 @@ class GraphMPNNTrainer:
             pred = self.model(batch)
             label = batch.y
             
-            # Handle label shape for loss computation
             if self.task_type == "classification":
                 label_for_loss = label.long()
             else:
@@ -500,12 +482,9 @@ class GraphMPNNTrainer:
             num_batches += 1
             
             if self.task_type == "classification":
-                # Use argmax for multi-class classification (including shortest_path)
                 if pred.dim() > 1 and pred.size(1) > 1:
-                    # Multi-class: pred has shape (batch_size, num_classes)
                     pred_classes = pred.argmax(dim=1)
                 else:
-                    # Binary or single output: round the predictions
                     pred.view(-1, 1)
                     pred_classes = torch.round(pred).to(torch.int64).squeeze(-1)
                 
@@ -523,8 +502,6 @@ class GraphMPNNTrainer:
             else:
                 mae = torch.mean(torch.abs(pred - label))
                 total_mae += mae.item()
-                # Optionally compute accuracy for regression-like tasks when requested
-                # by rounding predictions/labels to nearest integer and comparing.
                 eval_metrics = getattr(self, 'eval_metrics', None) or []
                 if 'accuracy' in [m.lower() for m in (eval_metrics or [])]:
                     pred_round = torch.round(pred).to(torch.int64)
@@ -539,12 +516,10 @@ class GraphMPNNTrainer:
         
         if self.task_type == "classification":
             metrics["accuracy"] = total_correct / total_samples if total_samples > 0 else 0.0
-            # Compute F1 score for classification tasks
             if all_labels:
                 metrics["f1_score"] = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
             else:
                 metrics["f1_score"] = 0.0
-            # Include MAE for distance-based classification tasks
             if "shortest_path" in self.task_name.lower():
                 metrics["mae"] = total_mae / num_batches if num_batches > 0 else 0.0
         else:

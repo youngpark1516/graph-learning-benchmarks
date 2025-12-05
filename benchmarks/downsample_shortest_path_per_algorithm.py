@@ -1,14 +1,3 @@
-#!/usr/bin/env python3
-"""Downsample shortest_path examples per algorithm by prediction token.
-
-This samples up to `--cap` examples for each (algorithm, lenN) group using
-`viz/query_analysis/query_prediction_by_graph.csv` as the source. Selected
-JSON files are copied into an output directory preserving the original
-`<algo>/<split>/filename.json` layout under the output root.
-
-Example:
-  python3 benchmarks/downsample_shortest_path_per_algorithm.py --cap 5000 --out submodules/graph-token/tasks_autograph/shortest_path_downsampled_per_algo_5k
-"""
 import argparse
 import csv
 import os

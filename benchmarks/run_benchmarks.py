@@ -70,6 +70,11 @@ def main():
     parser.add_argument("--test_algorithm", type=str, default=None, help="Override algorithm for test dataset (default: use same as --algorithm)")
     parser.add_argument("--test_algorithms", type=str, default=None, help="Comma-separated list of algorithms for test set (overrides --test_algorithm)")
     
+    # AutoGraph-specific arguments for ZINC
+    parser.add_argument("--use_autograph_with_features", action="store_true", help="For AutoGraph on ZINC: use trail + node features (default: topology-only)")
+    parser.add_argument("--use_autograph_interspersed", action="store_true", help="For AutoGraph on ZINC: intersperse atom types after each node in trail")
+    parser.add_argument("--use_autograph_interleaved_edges", action="store_true", help="For AutoGraph on ZINC: intersperse both atoms and bonds into trail")
+    
     # GraphGPS-specific arguments for positional encoding and normalization
     parser.add_argument("--use_lap_pe", action="store_true", help="Enable Laplacian Positional Encoding for GraphGPS")
     parser.add_argument("--lap_pe_dim", type=int, default=16, help="Dimension of Laplacian PE (default: 16)")
@@ -106,11 +111,13 @@ def main():
         "use_lap_pe": False,
         "lap_pe_dim": 16,
         "norm_type": "batch",
+        "use_autograph_with_features": False,
+        "use_autograph_interspersed": False,
+        "use_autograph_interleaved_edges": False,
     }
 
     # Auto-discover model config if not explicitly provided. Prefer YAML.
     if not args.model_config:
-        # look for common locations under the benchmarks/ folder
         candidates = [
             Path(__file__).resolve().parent / "model_configs.yaml",
         ]
@@ -120,7 +127,6 @@ def main():
                 print(f"Auto-detected model_config: {args.model_config}")
                 break
 
-    # Load optional per-model config (JSON or YAML) (overrides per model).
     model_cfg = {}
     if args.model_config:
         try:
@@ -131,7 +137,6 @@ def main():
             txt = None
 
         if txt:
-            # Try JSON first, then YAML if JSON parsing fails.
             try:
                 model_cfg = json.loads(txt)
             except Exception:
@@ -144,9 +149,6 @@ def main():
                 except Exception as e:
                     print(f"Failed to parse model_config {args.model_config} as YAML: {e}")
                     model_cfg = {}
-    # Extract top-level `global` config if present. These values will be merged
-    # into each model's per-model overrides (per-model keys win on conflict).
-    # For ZINC tasks, prefer zinc-specific global config
     is_zinc_task = "zinc" in str(args.task).lower()
     
     global_cfg = {}
@@ -181,13 +183,8 @@ def main():
     # Group identifier for wandb comparisons
     group_id = args.group or f"bench-{int(time.time())}"
 
-    # Run once per model, but pass the selected algorithms as a union to builders
     for model_name in models_to_run:
-            # Merge per-model overrides into a fresh args namespace so each model
-            # run receives its own hyperparameters.
-            # Merge `global` config with per-model overrides. Per-model keys override global ones.
             if isinstance(model_cfg, dict):
-                # For ZINC tasks, prefer zinc_{model_name} config
                 if is_zinc_task:
                     per_model = model_cfg.get(f"zinc_{model_name}", {}) or {}
                 else:
@@ -198,13 +195,9 @@ def main():
             if isinstance(per_model, dict):
                 overrides.update(per_model)
             model_vars = vars(args).copy()
-            # Pass algorithms (union) into the per-model args. Builders accept
-            # `args.algorithm` as either a string or a list of strings.
             model_vars['algorithms'] = algorithms_to_run if len(algorithms_to_run) > 1 else "+".join(algorithms_to_run)
             model_vars['algorithm'] = algorithms_to_run if len(algorithms_to_run) > 1 else algorithms_to_run[0]
-            # Apply overrides (shallow merge)
             model_vars.update(overrides)
-            # Ensure defaults exist so the per-model Namespace has all expected attributes
             for k, v in DEFAULT_MODEL_ARGS.items():
                 model_vars.setdefault(k, v)
             # Normalize eval_metrics if provided as comma-separated string on CLI
@@ -217,35 +210,28 @@ def main():
             # Create a Namespace for builder convenience
             model_args = argparse.Namespace(**model_vars)
 
-            # Make per-model unique run names. Do not include algorithm so
-            # logging/reporting is organized per model (not per model+algorithm).
             if getattr(model_args, 'run_name', None):
                 run_name = f"{model_args.run_name}-{model_name}-{int(time.time())}"
             else:
                 run_name = f"{model_name}-{model_args.task}-{int(time.time())}"
 
-            # initialize a separate wandb run per model, grouped together
             wandb.init(project=model_args.project, name=run_name, group=group_id, config=vars(model_args))
-
-            # Resolve device per-model (allow overrides in model config)
             device = torch.device(model_args.device)
-
             best_valid = float("inf")
             best_path = out_dir / f"{model_name}_best.pt"
-
-            # Check if task is ZINC
             is_zinc_task = "zinc" in str(model_args.task).lower()
 
             if is_zinc_task:
-                # Route to ZINC-specific builders
                 if model_name == "mpnn":
                     v = build_zinc_mpnn(model_args, device)
                 elif model_name == "graphgps":
                     v = build_zinc_graphgps(model_args, device)
                 else:
-                    v = build_zinc_transformer(model_args, device, model_name)
+                    use_features = getattr(model_args, 'use_autograph_with_features', False)
+                    use_interspersed = getattr(model_args, 'use_autograph_interspersed', False)
+                    use_interleaved_edges = getattr(model_args, 'use_autograph_interleaved_edges', False)
+                    v = build_zinc_transformer(model_args, device, model_name, use_autograph_with_features=use_features, use_autograph_interspersed=use_interspersed, use_autograph_interleaved_edges=use_interleaved_edges)
                 
-                # ZINC uses trainer-based models (MPNN, GraphGPS) or direct models (Transformers)
                 if "trainer" in v:
                     trainer = v["trainer"]
                     train_loader = v["train_loader"]
@@ -253,7 +239,6 @@ def main():
                     test_loader = v["test_loader"]
                     task_type = v["task_type"]
                     
-                    # Compute and log parameter counts
                     try:
                         model_obj = trainer.model
                         total_params = sum(p.numel() for p in model_obj.parameters())
@@ -263,7 +248,6 @@ def main():
                     except Exception:
                         pass
                     
-                    # Training loop for ZINC with trainer
                     for epoch in range(model_args.epochs):
                         epoch_start = time.time()
                         _ = trainer.train_epoch(train_loader)
@@ -280,7 +264,6 @@ def main():
                             best_valid = valid_loss
                             trainer.save_checkpoint(str(best_path))
                     
-                    # Evaluate on test set
                     trainer.load_checkpoint(str(best_path))
                     test_metrics = trainer.evaluate(test_loader)
                     wandb.log(_make_standard_test_log(model_name, task_type, test_metrics, eval_metrics=getattr(model_args, 'eval_metrics', None)))
@@ -288,14 +271,12 @@ def main():
                     if getattr(model_args, 'log_model', False):
                         wandb.save(str(best_path))
                 else:
-                    # Transformer-based model
                     model = v["model"]
                     train_loader = v["train_loader"]
                     valid_loader = v["valid_loader"]
                     test_loader = v["test_loader"]
                     task_type = v["task_type"]
                     
-                    # Compute and log parameter counts
                     try:
                         total_params = sum(p.numel() for p in model.parameters())
                         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -307,7 +288,6 @@ def main():
                     optimizer = torch.optim.Adam(model.parameters(), lr=model_args.learning_rate)
                     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, model_args.epochs))
                     
-                    # Training loop for ZINC transformer (regression)
                     for epoch in range(model_args.epochs):
                         epoch_start = time.time()
                         train_loss, train_mae, train_rmse = tu_train_regression_epoch(model, train_loader, optimizer, device, loss_name=getattr(model_args, 'loss', None))
@@ -326,7 +306,6 @@ def main():
                             best_valid = valid_loss
                             torch.save(model.state_dict(), str(best_path))
                     
-                    # Evaluate on test set
                     model.load_state_dict(torch.load(str(best_path)))
                     test_loss, test_mae, test_rmse = tu_eval_regression_epoch(model, test_loader, device, loss_name=getattr(model_args, 'loss', None))
                     test_metrics = {"loss": test_loss, "mae": test_mae, "rmse": test_rmse}
@@ -342,7 +321,6 @@ def main():
                 valid_loader = v["valid_loader"]
                 test_loader = v["test_loader"]
 
-                # Compute and log parameter counts for the MPNN model
                 try:
                     model_obj = trainer.model
                     total_params = sum(p.numel() for p in model_obj.parameters())
@@ -355,16 +333,13 @@ def main():
                 for epoch in range(model_args.epochs):
                     epoch_start = time.time()
                     
-                    # train step
                     _ = trainer.train_epoch(train_loader)
 
-                    # Gather consistent train/valid metrics dictionaries
                     train_metrics = trainer.evaluate(train_loader)
                     valid_metrics = trainer.evaluate(valid_loader)
 
                     logd = _make_standard_log(epoch, model_name, v["task_type"], train_metrics, valid_metrics, eval_metrics=getattr(model_args, 'eval_metrics', None))
                     
-                    # Add epoch timing
                     epoch_time = time.time() - epoch_start
                     logd["epoch_time"] = epoch_time
                     
@@ -375,7 +350,6 @@ def main():
                         best_valid = valid_loss
                         trainer.save_checkpoint(str(best_path))
 
-                # load best and evaluate test
                 trainer.load_checkpoint(str(best_path))
                 test_metrics = trainer.evaluate(test_loader)
                 wandb.log(_make_standard_test_log(model_name, v["task_type"], test_metrics, eval_metrics=getattr(model_args, 'eval_metrics', None)))
@@ -384,16 +358,12 @@ def main():
                     wandb.save(str(best_path))
 
             elif model_name == "graphgps":
-                # Use builders helper which attempts to load the repository
-                # submodule first, then top-level package, then the
-                # lightweight `benchmarks/graphgps.py` fallback.
                 v = builders_build_graphgps(model_args, device)
                 trainer = v["trainer"]
                 train_loader = v["train_loader"]
                 valid_loader = v["valid_loader"]
                 test_loader = v["test_loader"]
 
-                # Compute and log parameter counts for the GraphGPS model
                 try:
                     model_obj = trainer.model
                     total_params = sum(p.numel() for p in model_obj.parameters())
@@ -406,16 +376,13 @@ def main():
                 for epoch in range(model_args.epochs):
                     epoch_start = time.time()
                     
-                    # train step
                     _ = trainer.train_epoch(train_loader)
 
-                    # Gather consistent train/valid metrics dictionaries
                     train_metrics = trainer.evaluate(train_loader)
                     valid_metrics = trainer.evaluate(valid_loader)
 
                     logd = _make_standard_log(epoch, model_name, v["task_type"], train_metrics, valid_metrics, eval_metrics=getattr(model_args, 'eval_metrics', None))
                     
-                    # Add epoch timing
                     epoch_time = time.time() - epoch_start
                     logd["epoch_time"] = epoch_time
                     
@@ -439,7 +406,6 @@ def main():
                 train_loader = v["train_loader"]
                 valid_loader = v["valid_loader"]
 
-                # Compute and log parameter counts for transformer models
                 try:
                     model_obj = model
                     total_params = sum(p.numel() for p in model_obj.parameters())
@@ -458,7 +424,6 @@ def main():
                     train_loss, train_acc, train_f1 = train_transformer_epoch(model, train_loader, optimizer, device, loss_name=getattr(model_args, 'loss', None))
                     valid_result = eval_transformer_epoch(model, valid_loader, device, loss_name=getattr(model_args, 'loss', None), task_name=model_args.task)
                     
-                    # Handle variable return values (with/without MAE)
                     if len(valid_result) == 4:
                         valid_loss, valid_acc, valid_f1, valid_mae = valid_result
                     else:
@@ -467,7 +432,6 @@ def main():
                     
                     scheduler.step()
 
-                    # Build standardized metric dicts for transformer
                     train_metrics = {"loss": train_loss, "accuracy": train_acc, "f1_score": train_f1}
                     valid_metrics = {"loss": valid_loss, "accuracy": valid_acc, "f1_score": valid_f1}
                     if valid_mae is not None:
@@ -475,18 +439,15 @@ def main():
 
                     logd = _make_standard_log(epoch, model_name, "classification", train_metrics, valid_metrics, eval_metrics=getattr(model_args, 'eval_metrics', None))
                     
-                    # Add epoch timing
                     epoch_time = time.time() - epoch_start
                     logd["epoch_time"] = epoch_time
                     
                     wandb.log(logd)
 
-                    # save best
                     if valid_loss < best_valid:
                         best_valid = valid_loss
                         torch.save(model.state_dict(), str(best_path))
 
-                # load best and evaluate test set for transformer
                 try:
                     model.load_state_dict(torch.load(str(best_path)))
                     test_loader = v.get("test_loader")
@@ -503,20 +464,16 @@ def main():
                             test_metrics["mae"] = test_mae
                         wandb.log(_make_standard_test_log(model_name, "classification", test_metrics, eval_metrics=getattr(model_args, 'eval_metrics', None)))
                 except Exception:
-                    # If loading or evaluation fails, log nothing but continue
                     pass
 
-                # final test/validation snapshot
                 if getattr(model_args, 'log_model', False):
                     wandb.save(str(best_path))
 
-            # Save run config for this model and finish the wandb run
             cfg_path = out_dir / f"{run_name}_config.json"
             with cfg_path.open("w") as f:
                 json.dump(vars(model_args), f, indent=2)
             wandb.save(str(cfg_path))
             wandb.finish()
-    # end algorithm loop
 
 
 if __name__ == "__main__":

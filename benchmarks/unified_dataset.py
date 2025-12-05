@@ -103,7 +103,6 @@ class UnifiedGraphDataset(Dataset):
         for json_file in json_files:
             with json_file.open() as f:
                 data = json.load(f)
-                # Handle both list format and dict format
                 if isinstance(data, list):
                     samples.extend(data)
                 elif isinstance(data, dict):
@@ -154,7 +153,6 @@ class TokenizedGraphDataset(UnifiedGraphDataset):
             text = sample.get("text", "")
             token_list = text.split()
             
-            # Find prediction token (after <p>)
             if "<p>" in token_list:
                 p_idx = token_list.index("<p>")
                 input_tokens = token_list[:p_idx]
@@ -165,7 +163,6 @@ class TokenizedGraphDataset(UnifiedGraphDataset):
             else:
                 tokens.update(token_list)
         
-        # Build token vocab with special tokens
         special_tokens = ["<pad>", "<unk>", "<bos>", "<eos>", "<e>", "<n>", "<q>", "<p>"]
         self.token2idx = {token: idx for idx, token in enumerate(special_tokens)}
         
@@ -175,7 +172,6 @@ class TokenizedGraphDataset(UnifiedGraphDataset):
         
         self.idx2token = {v: k for k, v in self.token2idx.items()}
         
-        # Build label vocab
         self.label_vocab = {label: idx for idx, label in enumerate(sorted(labels))}
         
         print(f"Built vocabulary: {len(self.token2idx)} tokens, {len(self.label_vocab)} labels")
@@ -197,7 +193,6 @@ class TokenizedGraphDataset(UnifiedGraphDataset):
         text = sample.get("text", "")
         token_list = text.split()
         
-        # Split at <p> marker
         if "<p>" in token_list:
             p_idx = token_list.index("<p>")
             input_tokens = token_list[:p_idx]
@@ -206,20 +201,17 @@ class TokenizedGraphDataset(UnifiedGraphDataset):
             input_tokens = token_list
             label_token = "<unk>"
         
-        # Convert to indices
         input_ids = [self.token2idx.get(token, self.token2idx["<unk>"]) for token in input_tokens]
         
-        # Truncate or pad
         if len(input_ids) > self.max_seq_len:
             input_ids = input_ids[:self.max_seq_len]
         else:
             input_ids = input_ids + [self.token2idx["<pad>"]] * (self.max_seq_len - len(input_ids))
         
-        # Get label index
         if label_token in self.label_vocab:
             label_idx = self.label_vocab[label_token]
         else:
-            label_idx = 0  # Default to first label if not found
+            label_idx = 0
         
         return torch.tensor(input_ids, dtype=torch.long), torch.tensor(label_idx, dtype=torch.long)
 
@@ -239,7 +231,6 @@ class PyGGraphDataset(UnifiedGraphDataset):
         self.add_query_features = add_query_features
         self.task_name = task
         
-        # Parse all samples
         self.graphs = []
         self.labels = []
         self.query_nodes = []
@@ -261,11 +252,9 @@ class PyGGraphDataset(UnifiedGraphDataset):
         graph = nx.Graph()
         idx = 0
         
-        # Skip <bos>
         if idx < len(tokens) and tokens[idx] == "<bos>":
             idx += 1
         
-        # Parse edges (before <n>)
         while idx < len(tokens) and tokens[idx] not in ["<n>", "<q>", "<p>"]:
             token = tokens[idx]
             
@@ -273,7 +262,6 @@ class PyGGraphDataset(UnifiedGraphDataset):
                 idx += 1
                 continue
             
-            # Try to parse edge
             try:
                 if idx + 1 < len(tokens):
                     u = int(token)
@@ -307,7 +295,7 @@ class PyGGraphDataset(UnifiedGraphDataset):
             p_idx = tokens.index("<p>")
             if p_idx + 1 < len(tokens):
                 label_token = tokens[p_idx + 1]
-                # Try to extract numeric value from token like "len3" -> 3
+                # extract numeric value from token
                 if label_token.startswith("len"):
                     try:
                         label = float(label_token[3:])
@@ -325,24 +313,20 @@ class PyGGraphDataset(UnifiedGraphDataset):
         """Convert NetworkX graph to PyTorch Geometric Data object."""
         from torch_geometric.data import Data
         
-        # Build node features
         node_features = []
         nodes = sorted(graph.nodes())
         
         if len(nodes) == 0:
-            # Empty graph fallback
             feature_dim = 3 if query_nodes else 1
             x = torch.zeros((1, feature_dim), dtype=torch.float)
             edge_index = torch.tensor([[], []], dtype=torch.long)
             return Data(x=x, edge_index=edge_index)
         
-        # Create mapping from original node indices to contiguous indices [0, 1, 2, ...]
         node_to_idx = {node: idx for idx, node in enumerate(nodes)}
         
         for node in nodes:
             features = [float(graph.degree(node))]
             
-            # Add query encoding for shortest_path
             if query_nodes is not None and self.add_query_features:
                 query_u, query_v = query_nodes
                 is_source = 1.0 if node == query_u else 0.0
@@ -353,13 +337,12 @@ class PyGGraphDataset(UnifiedGraphDataset):
         
         x = torch.tensor(node_features, dtype=torch.float)
         
-        # Build edge index with remapped node indices
         edge_list = []
         for u, v in graph.edges():
             u_idx = node_to_idx[u]
             v_idx = node_to_idx[v]
             edge_list.append([u_idx, v_idx])
-            edge_list.append([v_idx, u_idx])  # Undirected graph
+            edge_list.append([v_idx, u_idx])
         
         if len(edge_list) == 0:
             edge_index = torch.tensor([[], []], dtype=torch.long)

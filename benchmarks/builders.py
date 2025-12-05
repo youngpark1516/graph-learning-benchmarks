@@ -9,7 +9,6 @@ from types import SimpleNamespace
 
 
 def build_mpnn(args, device):
-    # Import inside function to avoid heavy imports at module-import time
     from mpnn import GraphTaskDataset, GIN, GraphMPNNTrainer, collate_fn
 
     # Allow `args.algorithm` to be a list/tuple to form a union of datasets
@@ -18,15 +17,12 @@ def build_mpnn(args, device):
         if isinstance(algo, (list, tuple)):
             ds_list = [fn(args.data_dir, args.task, a, split, *extra_args, **kwargs) for a in algo]
             concat = ConcatDataset(ds_list)
-            # propagate simple attributes (vocab) from first dataset if present
             first = ds_list[0] if len(ds_list) > 0 else None
             if first is not None:
                 for attr in ('token2idx', 'idx2token', 'vocab_size'):
                     if hasattr(first, attr):
                         val = getattr(first, attr)
                         setattr(concat, attr, val)
-                        # also propagate into each inner dataset so their
-                        # __getitem__ uses the shared vocabulary
                         for ds in ds_list:
                             try:
                                 setattr(ds, attr, val)
@@ -38,22 +34,18 @@ def build_mpnn(args, device):
 
     train_dataset = _maybe_concat(GraphTaskDataset, "train")
     valid_dataset = _maybe_concat(GraphTaskDataset, "valid")
-    # Use test_algorithm if provided, otherwise use training algorithm
     test_algo = args.test_algorithm or args.algorithm
     test_dataset = _maybe_concat(GraphTaskDataset, "test", test_algo)
 
-    # Optionally limit dataset sizes via args (set in model config or CLI overrides)
-    # For multi-algorithm datasets (ConcatDataset), sample uniformly across all algorithms
     try:
         import random
         
         def _sample_subset(dataset, max_samples, seed=42):
-            """Sample uniformly from dataset (important for ConcatDataset with multiple algos)."""
+            """Sample uniformly from dataset."""
             if max_samples is None or max_samples <= 0:
                 return dataset
             
             n = min(len(dataset), int(max_samples))
-            # Use random sampling instead of range() to avoid bias
             rng = random.Random(seed)
             indices = sorted(rng.sample(range(len(dataset)), n))
             return Subset(dataset, indices)
@@ -62,46 +54,37 @@ def build_mpnn(args, device):
         valid_dataset = _sample_subset(valid_dataset, getattr(args, 'max_samples_valid', None), seed=43)
         test_dataset = _sample_subset(test_dataset, getattr(args, 'max_samples_test', None), seed=44)
     except Exception:
-        # Keep original datasets on any error
         pass
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
     valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
 
-    # Determine feature dimension based on task
-    # shortest_path tasks need query node features (3D: degree + is_source + is_target)
-    # other tasks only use node degree (1D)
     task_name = args.task if isinstance(args.task, str) else str(args.task)
     is_shortest_path = "shortest_path" in task_name.lower()
     in_features = 3 if is_shortest_path else 1
     
-    # Determine task type and output features for classification
     task_type = "classification" if args.task in ["cycle_check", "shortest_path"] or "shortest_path" in args.task else "regression"
     
-    # For classification, determine number of classes from training data
     out_features = 1
     if task_type == "classification":
         try:
             import math
             labels = []
             base_train = train_dataset.dataset if hasattr(train_dataset, 'dataset') else train_dataset
-            # Sample labels comprehensively
             sample_size = min(len(base_train), 5000)
             for i in range(sample_size):
                 try:
                     _, label = base_train[i]
                     label_val = float(label)
-                    # Skip infinity labels (unreachable nodes) - will be mapped to separate class
+                    # Skip infinity labels
                     if not math.isinf(label_val):
                         labels.append(int(label_val))
                 except Exception:
                     pass
             if labels:
-                # For distance-based tasks like shortest_path, use max label + 1 as num_classes
-                # Add 1 extra class for infinity/unreachable nodes
                 max_label = max(labels)
-                num_classes = max_label + 1 + 1  # +1 for unreachable class
+                num_classes = max_label + 1 + 1
                 out_features = max(2, num_classes)
             else:
                 out_features = 2
@@ -111,7 +94,6 @@ def build_mpnn(args, device):
     
     model = GIN(in_features=in_features, hidden_dim=args.hidden_dim, num_layers=args.num_layers, out_features=out_features, dropout=0.1)
     
-    # Print model architecture
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"\n{'='*70}")
@@ -130,8 +112,6 @@ def build_mpnn(args, device):
         loss=getattr(args, 'loss', None),
         task_name=args.task,
     )
-    # Propagate requested eval metrics (list or None) to trainer so it can
-    # compute optional metrics like accuracy for regression tasks.
     try:
         trainer.eval_metrics = getattr(args, 'eval_metrics', None)
     except Exception:
@@ -147,7 +127,7 @@ def build_mpnn(args, device):
 
 
 def build_transformer(args, device, which):
-    # Lazy import to avoid heavy module loads during import-time checks
+    # Lazy import
     if which == "graph_transformer":
         from graph_transformer import GraphDataset, GraphTransformer as Transformer
     else:
@@ -155,7 +135,6 @@ def build_transformer(args, device, which):
         GraphDataset = AGDataset
         Transformer = AGTransformer
 
-    # Forward sampling args so datasets can sample `n_samples_per_file` per JSON
     def _maybe_concat_graphdataset(split, algo=None):
         algo = algo or args.algorithm
         common_kwargs = dict(
@@ -183,12 +162,9 @@ def build_transformer(args, device, which):
 
     train_dataset = _maybe_concat_graphdataset("train")
     valid_dataset = _maybe_concat_graphdataset("valid")
-    # Use test_algorithm if provided, otherwise use training algorithm
     test_algo = args.test_algorithm or args.algorithm
     test_dataset = _maybe_concat_graphdataset("test", test_algo)
 
-    # Optionally limit dataset sizes via args (set in model config or CLI overrides)
-    # For multi-algorithm datasets (ConcatDataset), sample uniformly across all algorithms
     try:
         import random
         
@@ -198,7 +174,6 @@ def build_transformer(args, device, which):
                 return dataset
             
             n = min(len(dataset), int(max_samples))
-            # Use random sampling instead of range() to avoid bias
             rng = random.Random(seed)
             indices = sorted(rng.sample(range(len(dataset)), n))
             return Subset(dataset, indices)
@@ -207,18 +182,15 @@ def build_transformer(args, device, which):
         valid_dataset = _sample_subset(valid_dataset, getattr(args, 'max_samples_valid', None), seed=43)
         test_dataset = _sample_subset(test_dataset, getattr(args, 'max_samples_test', None), seed=44)
     except Exception:
-        # Keep original datasets on any error
         pass
 
-    # Share vocabulary if available. If datasets are wrapped in `Subset`,
-    # extract the underlying base dataset to access `token2idx`/`vocab_size`.
+    # Share vocabulary if available
     def _base(ds):
         try:
             from torch.utils.data import Subset as _Subset, ConcatDataset as _Concat
             if isinstance(ds, _Subset):
                 return ds.dataset
             if isinstance(ds, _Concat):
-                # return the first underlying dataset for vocab inspection
                 return ds.datasets[0] if len(ds.datasets) > 0 else ds
             return ds
         except Exception:
@@ -233,7 +205,6 @@ def build_transformer(args, device, which):
             base_valid.token2idx = base_train.token2idx
             base_valid.idx2token = base_train.idx2token
             base_valid.vocab_size = base_train.vocab_size
-            # token-id mismatches between training and test time.
             base_test.token2idx = base_train.token2idx
             base_test.idx2token = base_train.idx2token
             base_test.vocab_size = base_train.vocab_size
@@ -276,11 +247,9 @@ def build_transformer(args, device, which):
     valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
 
-    # Ensure we pass the underlying dataset's vocab_size (handle Subset wrappers).
     vocab_size = getattr(base_train, 'vocab_size', None)
     model = Transformer(vocab_size=vocab_size, d_model=args.d_model, n_heads=args.n_heads, n_layers=args.n_layers, d_ff=args.d_ff, dropout=args.dropout, max_seq_length=args.max_seq_length).to(device)
     
-    # Print model architecture
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     model_name = "Graph Transformer" if which == "graph_transformer" else "AutoGraph Transformer"
@@ -309,7 +278,6 @@ def build_graphgps(args, device):
     full-featured `graphgps` package (if available under `submodules/graphgps`
     or on PYTHONPATH), otherwise use the bundled lightweight implementation.
     """
-    # Normalize device to a string for downstream builders that expect it
     try:
         device_arg = str(device)
     except Exception:
@@ -318,43 +286,20 @@ def build_graphgps(args, device):
     repo_root = Path(__file__).resolve().parents[1]
     submodule_path = repo_root / "submodules" / "graphgps"
 
-    # Ensure local `benchmarks/` modules (e.g. `mpnn.py`) are importable
     benchmarks_dir = repo_root / "benchmarks"
     if str(benchmarks_dir) not in sys.path:
         sys.path.insert(0, str(benchmarks_dir))
 
-    # Try to ensure the repo submodule is importable by adding it to sys.path
     if submodule_path.exists():
         sp = str(submodule_path)
         if sp not in sys.path:
             sys.path.insert(0, sp)
 
-    # Try importing a build_graphgps callable from the installed/submodule
     try:
-        pkg = importlib.import_module("graphgps")
-        if hasattr(pkg, "build_graphgps"):
-            return getattr(pkg, "build_graphgps")(args, device_arg)
-    except Exception:
-        # ignore and fall through to fallback loader
-        pass
-
-    # Try importing a top-level module `graphgps` (if available on PYTHONPATH)
-    try:
-        pkg = importlib.import_module("graphgps")
-        if hasattr(pkg, "build_graphgps"):
-            return getattr(pkg, "build_graphgps")(args, device_arg)
-    except Exception:
-        pass
-
-    # Finally, fall back to the lightweight implementation bundled under
-    # `benchmarks/graphgps.py`.
-    try:
-        # First try a normal import relative to this package
         mod = importlib.import_module("benchmarks.graphgps")
         if hasattr(mod, "build_graphgps"):
             return mod.build_graphgps(args, device_arg)
     except Exception:
-        # Last-resort: load by file path
         try:
             fallback = Path(__file__).resolve().parent / "graphgps.py"
             spec = importlib.util.spec_from_file_location("benchmarks_graphgps_fallback", str(fallback))
@@ -375,7 +320,6 @@ def build_mpnn_zinc(args, device):
     valid_dataset = ZincGraphTaskDataset(args.data_dir, split="valid", subset=True)
     test_dataset = ZincGraphTaskDataset(args.data_dir, split="test", subset=True)
     
-    # Optionally limit dataset sizes
     try:
         if getattr(args, 'max_samples_train', None) and args.max_samples_train > 0:
             n = min(len(train_dataset), int(args.max_samples_train))
@@ -393,13 +337,12 @@ def build_mpnn_zinc(args, device):
     valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
     
-    # ZINC logp is regression task
     model = GIN(in_features=1, hidden_dim=args.hidden_dim, num_layers=args.num_layers, out_features=1, dropout=0.1)
     trainer = GraphMPNNTrainer(
         model,
         learning_rate=args.learning_rate,
         device=device,
-        task_type="regression",  # ZINC is regression (logP prediction)
+        task_type="regression",
         loss=getattr(args, 'loss', None),
     )
     
@@ -428,7 +371,6 @@ def build_transformer_zinc(args, device, which):
         from autograph_transformer import GraphTransformer as AGTransformer
         Transformer = AGTransformer
     
-    # Try to load from preprocessed data
     preprocessed_dir = getattr(args, 'preprocessed_zinc_dir', None)
     if preprocessed_dir and Path(preprocessed_dir).exists():
         from preprocess_zinc_loader import PreprocessedGraphTransformerZincDataset, PreprocessedAutoGraphTransformerZincDataset
@@ -447,7 +389,6 @@ def build_transformer_zinc(args, device, which):
             print("Falling back to on-the-fly tokenization...")
             preprocessed_dir = None
     
-    # Fall back to on-the-fly tokenization
     if not preprocessed_dir or not Path(preprocessed_dir).exists():
         from zinc_dataset import GraphTransformerZincDataset, AutoGraphTransformerZincDataset
         
@@ -475,7 +416,6 @@ def build_transformer_zinc(args, device, which):
             max_seq_length=args.max_seq_length,
         )
     
-    # Optionally limit dataset sizes
     try:
         if getattr(args, 'max_samples_train', None) and args.max_samples_train > 0:
             n = min(len(train_dataset), int(args.max_samples_train))
@@ -489,7 +429,6 @@ def build_transformer_zinc(args, device, which):
     except Exception:
         pass
     
-    # Share vocabulary across splits
     def _base(ds):
         try:
             if isinstance(ds, Subset):
@@ -537,7 +476,6 @@ def build_graphgps_zinc(args, device):
     valid_dataset = ZincPyGDataset(args.data_dir, split="valid", subset=True)
     test_dataset = ZincPyGDataset(args.data_dir, split="test", subset=True)
     
-    # Optionally limit dataset sizes
     try:
         if getattr(args, 'max_samples_train', None) and args.max_samples_train > 0:
             n = min(len(train_dataset), int(args.max_samples_train))
@@ -551,13 +489,11 @@ def build_graphgps_zinc(args, device):
     except Exception:
         pass
     
-    # Use PyG Batch collate for graph datasets
     from torch_geometric.data import DataLoader as PyGDataLoader
     train_loader = PyGDataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     valid_loader = PyGDataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False)
     test_loader = PyGDataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
     
-    # Build SimpleGPS model directly
     batch_size = getattr(args, "batch_size", 32)
     learning_rate = getattr(args, "learning_rate", 1e-3)
     hidden_dim = getattr(args, "d_model", 64)
@@ -577,7 +513,7 @@ def build_graphgps_zinc(args, device):
         
         def forward(self, batch):
             x, edge_index, batch_idx = batch.x, batch.edge_index, batch.batch
-            x = x.float()  # Ensure float dtype
+            x = x.float()
             x = self.input_lin(x)
             for conv in self.convs:
                 x = conv(x, edge_index)
@@ -597,7 +533,7 @@ def build_graphgps_zinc(args, device):
             self.opt = torch.optim.Adam(self.model.parameters(), lr=lr)
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.opt, T_max=100)
             self.task_type = task_type
-            self.loss_fn = nn.MSELoss()  # ZINC is regression
+            self.loss_fn = nn.MSELoss()
         
         def train_epoch(self, loader: PyGDataLoader) -> float:
             self.model.train()
@@ -660,7 +596,6 @@ def build_zinc_mpnn(args, device):
     from zinc_dataset import ZINCLoader
     from mpnn import GIN, GraphMPNNTrainer, collate_fn
     
-    # Load ZINC dataset - return tuples for MPNN collate_fn
     subset = not ("250" in str(getattr(args, 'task', 'zinc')))
     data_dir = getattr(args, 'data_dir', None) or "./data/ZINC"
     
@@ -668,25 +603,22 @@ def build_zinc_mpnn(args, device):
     valid_dataset = ZINCLoader.load_pyg_data(root=data_dir, split="val", subset=subset, return_tuple=True)
     test_dataset = ZINCLoader.load_pyg_data(root=data_dir, split="test", subset=subset, return_tuple=True)
     
-    # Create dataloaders
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
     valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
     
-    # Get feature dimension from first sample
     sample_item = train_dataset[0]
     if isinstance(sample_item, tuple):
-        sample, _ = sample_item  # Unpack (data, label) tuple
+        sample, _ = sample_item
     else:
         sample = sample_item
     in_features = sample.x.shape[1] if hasattr(sample, 'x') and sample.x is not None else 1
     
-    # Build GIN model for regression
     model = GIN(
         in_features=in_features,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
-        out_features=1,  # Regression: single output
+        out_features=1,
         dropout=0.1,
     )
     
@@ -701,7 +633,6 @@ def build_zinc_mpnn(args, device):
     print(f"Trainable Parameters: {trainable_params:,}")
     print(f"{'='*70}\n")
     
-    # Build trainer with MAE loss for regression
     trainer = GraphMPNNTrainer(
         model,
         learning_rate=args.learning_rate,
@@ -721,7 +652,9 @@ def build_zinc_mpnn(args, device):
     }
 
 
-def build_zinc_transformer(args, device, which="graph_transformer", use_autograph: bool = False):
+def build_zinc_transformer(args, device, which="graph_transformer", use_autograph: bool = False, 
+                           use_autograph_with_features: bool = False, use_autograph_interspersed: bool = False,
+                           use_autograph_interleaved_edges: bool = False):
     """Build Transformer for ZINC molecular property prediction.
     
     Tokenizes molecular graphs for transformer processing.
@@ -730,12 +663,14 @@ def build_zinc_transformer(args, device, which="graph_transformer", use_autograp
         args: Configuration arguments
         device: Torch device (cuda or cpu)
         which: Model type identifier
-        use_autograph: If True, use AutoGraph's trail-based tokenization
+        use_autograph: If True, use AutoGraph's trail-based tokenization (topology only)
+        use_autograph_with_features: If True, use AutoGraph's trail with node features appended
+        use_autograph_interspersed: If True, use AutoGraph's trail with atoms interspersed after nodes
+        use_autograph_interleaved_edges: If True, use AutoGraph's trail with atoms and bonds interleaved
     """
     from zinc_dataset import ZINCLoader
     from graph_transformer import GraphTransformer as Transformer
     
-    # Load ZINC dataset
     subset = not ("250" in str(getattr(args, 'task', 'zinc')))
     data_dir = getattr(args, 'data_dir', None) or "./data/ZINC"
     
@@ -745,6 +680,9 @@ def build_zinc_transformer(args, device, which="graph_transformer", use_autograp
         subset=subset,
         max_seq_len=args.max_seq_length,
         use_autograph=use_autograph,
+        use_autograph_with_features=use_autograph_with_features,
+        use_autograph_interspersed=use_autograph_interspersed,
+        use_autograph_interleaved_edges=use_autograph_interleaved_edges,
         random_seed=getattr(args, 'random_seed', 1234)
     )
     valid_dataset = ZINCLoader.load_tokenized_data(
@@ -753,6 +691,9 @@ def build_zinc_transformer(args, device, which="graph_transformer", use_autograp
         subset=subset,
         max_seq_len=args.max_seq_length,
         use_autograph=use_autograph,
+        use_autograph_with_features=use_autograph_with_features,
+        use_autograph_interspersed=use_autograph_interspersed,
+        use_autograph_interleaved_edges=use_autograph_interleaved_edges,
         random_seed=getattr(args, 'random_seed', 1235)
     )
     test_dataset = ZINCLoader.load_tokenized_data(
@@ -761,10 +702,12 @@ def build_zinc_transformer(args, device, which="graph_transformer", use_autograp
         subset=subset,
         max_seq_len=args.max_seq_length,
         use_autograph=use_autograph,
+        use_autograph_with_features=use_autograph_with_features,
+        use_autograph_interspersed=use_autograph_interspersed,
+        use_autograph_interleaved_edges=use_autograph_interleaved_edges,
         random_seed=getattr(args, 'random_seed', 1236)
     )
     
-    # Propagate vocabulary
     try:
         if hasattr(train_dataset, 'token2idx'):
             valid_dataset.token2idx = train_dataset.token2idx
@@ -772,16 +715,15 @@ def build_zinc_transformer(args, device, which="graph_transformer", use_autograp
     except Exception:
         pass
     
-    # Create dataloaders
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
     
-    # Get vocab size
-    vocab_size = len(train_dataset.token2idx) if hasattr(train_dataset, 'token2idx') else 200
+    if hasattr(train_dataset, 'token2idx'):
+        vocab_size = max(train_dataset.token2idx.values()) + 1
+    else:
+        vocab_size = 200
     
-    # Build transformer for regression
-    # Wrap Transformer for regression: use mean pooling of hidden states -> linear layer
     base_model = Transformer(
         vocab_size=vocab_size,
         d_model=args.d_model,
@@ -792,7 +734,6 @@ def build_zinc_transformer(args, device, which="graph_transformer", use_autograp
         max_seq_length=args.max_seq_length,
     ).to(device)
     
-    # Create regression wrapper
     class TransformerRegressor(torch.nn.Module):
         def __init__(self, transformer, d_model):
             super().__init__()
@@ -800,7 +741,6 @@ def build_zinc_transformer(args, device, which="graph_transformer", use_autograp
             self.head = torch.nn.Linear(d_model, 1)
         
         def forward(self, input_ids, attention_mask=None):
-            # Get transformer encoder output
             x = self.transformer.token_embedding(input_ids)
             x = x + self.transformer.position_embedding[:input_ids.size(1)].unsqueeze(0)
             x = self.transformer.dropout(x)
@@ -810,23 +750,29 @@ def build_zinc_transformer(args, device, which="graph_transformer", use_autograp
                 x = layer(x, mask=key_padding_mask)
             x = x.transpose(0, 1)
             
-            # Mean pool over sequence
             if attention_mask is not None:
                 x_masked = x * attention_mask.unsqueeze(-1)
                 x_mean = x_masked.sum(dim=1) / attention_mask.sum(dim=1, keepdim=True).clamp(min=1)
             else:
                 x_mean = x.mean(dim=1)
             
-            # Regression head
             out = self.head(x_mean)
             return out
     
     model = TransformerRegressor(base_model, args.d_model).to(device)
     
-    # Print model info
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    tokenizer_type = "AutoGraph" if use_autograph else "Simple"
+    if use_autograph_interleaved_edges:
+        tokenizer_type = "AutoGraph+Interleaved(Atoms+Bonds)"
+    elif use_autograph_interspersed:
+        tokenizer_type = "AutoGraph+Interspersed"
+    elif use_autograph_with_features:
+        tokenizer_type = "AutoGraph+Features"
+    elif use_autograph:
+        tokenizer_type = "AutoGraph"
+    else:
+        tokenizer_type = "Simple"
     print(f"\n{'='*70}")
     print(f"[ZINC {which.upper()}] Model Architecture (Tokenizer: {tokenizer_type})")
     print(f"{'='*70}")
@@ -850,7 +796,6 @@ def build_zinc_graphgps(args, device):
     from zinc_dataset import ZINCLoader
     from torch_geometric.data import DataLoader as PyGDataLoader
     
-    # Load ZINC dataset - return Data objects (not tuples) for PyG DataLoader
     subset = not ("250" in str(getattr(args, 'task', 'zinc')))
     data_dir = getattr(args, 'data_dir', None) or "./data/ZINC"
     
@@ -858,16 +803,13 @@ def build_zinc_graphgps(args, device):
     valid_dataset = ZINCLoader.load_pyg_data(root=data_dir, split="val", subset=subset, return_tuple=False)
     test_dataset = ZINCLoader.load_pyg_data(root=data_dir, split="test", subset=subset, return_tuple=False)
     
-    # Create dataloaders - PyG DataLoader will handle batching
     train_loader = PyGDataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     valid_loader = PyGDataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False)
     test_loader = PyGDataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
     
-    # Get feature dimension from first sample
     sample = train_dataset[0]
     in_features = sample.x.shape[1] if hasattr(sample, 'x') and sample.x is not None else 1
     
-    # Create simple GPS model
     from torch_geometric.nn import TransformerConv, global_mean_pool
     import torch.nn.functional as F
     
@@ -881,7 +823,7 @@ def build_zinc_graphgps(args, device):
                 TransformerConv(hidden_dim, hidden_dim // n_heads, n_heads, dropout=dropout, edge_dim=None, concat=True)
                 for _ in range(n_layers)
             ])
-            self.out_proj = torch.nn.Linear(hidden_dim, 1)  # Regression output
+            self.out_proj = torch.nn.Linear(hidden_dim, 1)
         
         def forward(self, data):
             x = self.in_proj(data.x)
@@ -899,7 +841,6 @@ def build_zinc_graphgps(args, device):
         dropout=args.dropout
     ).to(device)
     
-    # Print model info
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"\n{'='*70}")
@@ -910,13 +851,12 @@ def build_zinc_graphgps(args, device):
     print(f"Trainable Parameters: {trainable_params:,}")
     print(f"{'='*70}\n")
     
-    # Simple trainer class
     class SimpleTrainer:
         def __init__(self, model, lr, device, task_type="regression"):
             self.model = model
             self.device = device
             self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-            self.loss_fn = torch.nn.L1Loss()  # MAE loss
+            self.loss_fn = torch.nn.L1Loss()
         
         def train_epoch(self, loader):
             self.model.train()
