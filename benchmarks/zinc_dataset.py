@@ -1,10 +1,3 @@
-"""ZINC 12 dataset loader for molecular property prediction.
-
-Provides dataset loaders compatible with MPNN, Transformer, and GraphGPS models.
-Uses PyTorch Geometric's ZINC dataset with automatic downloading and caching.
-Supports both custom tokenization and AutoGraph trail-based tokenization.
-"""
-
 import torch
 from pathlib import Path
 from typing import Optional, Tuple, Dict
@@ -44,13 +37,11 @@ class ZINCDataset(InMemoryDataset):
         self.subset = subset
         self._split = "train" if split == "train" else ("val" if split == "val" else "test")
         super().__init__(root, transform, pre_transform)
-        
-        # Load from cache
         if split == "train":
             self.pyg_dataset = torch.load(self.processed_paths[0])
         elif split == "val":
             self.pyg_dataset = torch.load(self.processed_paths[1])
-        else:  # test
+        else:
             self.pyg_dataset = torch.load(self.processed_paths[2])
     
     @property
@@ -72,14 +63,11 @@ class ZINCDataset(InMemoryDataset):
     
     def process(self):
         """Process and cache ZINC dataset splits."""
-        # Load splits from PyG
         train_dataset = ZINC(self.raw_dir, subset=self.subset, split='train')
         val_dataset = ZINC(self.raw_dir, subset=self.subset, split='val')
         test_dataset = ZINC(self.raw_dir, subset=self.subset, split='test')
         
         print(f"ZINC dataset loaded: train={len(train_dataset)}, val={len(val_dataset)}, test={len(test_dataset)}")
-        
-        # Save raw datasets (not collated) for per-sample access
         torch.save(train_dataset, self.processed_paths[0])
         torch.save(val_dataset, self.processed_paths[1])
         torch.save(test_dataset, self.processed_paths[2])
@@ -118,8 +106,6 @@ class ZINCLoader:
             PyG-compatible dataset
         """
         zinc_ds = ZINCDataset(root=root, split=split, subset=subset)
-        # Always wrap with ZINCGraphDataset to apply one-hot encoding
-        return ZINCGraphDataset(zinc_ds, return_tuple=return_tuple)
     
     @staticmethod
     def load_tokenized_data(
@@ -194,10 +180,7 @@ class TokenizedZINCDataset(Dataset):
         self.token2idx = self._build_vocab()
     
     def _build_vocab(self) -> Dict[str, int]:
-        """Build vocabulary from atom and bond types.
-        
-        Format: <bos> u1 bond1 v1 <e> u2 bond2 v2 <e> ... <n> u1 atom1 u2 atom2 ... <eos>
-        """
+        """Build vocabulary from atom and bond types."""
         vocab = {
             "<pad>": 0,
             "<unk>": 1,
@@ -210,17 +193,14 @@ class TokenizedZINCDataset(Dataset):
         }
         idx = 8
         
-        # Add atom types (atomic numbers 0-118)
         for i in range(119):
             vocab[f"atom_{i}"] = idx
             idx += 1
         
-        # Add bond types (ZINC uses numeric: 1=single, 2=double, 3=triple)
         for bond_type in range(1, 5):
             vocab[f"bond_{bond_type}"] = idx
             idx += 1
         
-        # Add node indices (for edge endpoints and node list)
         for node_id in range(100):  # Support up to 100 node IDs
             vocab[f"node_{node_id}"] = idx
             idx += 1
@@ -228,27 +208,14 @@ class TokenizedZINCDataset(Dataset):
         return vocab
     
     def _tokenize_graph(self, data: Data) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Convert PyG graph to token sequence using graph-token format.
-        
-        Format: <bos> u1 bond1 v1 <e> u2 bond2 v2 <e> ... <n> u1 atom1 u2 atom2 ... <eos>
-        
-        For undirected graphs, each bond is encoded only once (canonical form: min(u,v) max(u,v))
-        
-        Args:
-            data: PyG Data object
-            
-        Returns:
-            Tuple of (input_ids, attention_mask)
-        """
+        """Convert PyG graph to token sequence."""
         tokens = [self.token2idx["<bos>"]]
         
-        # Add edges with bond features (undirected: encode each bond once)
         # Format: u bond_type v <e> u bond_type v <e> ...
         if hasattr(data, 'edge_index') and data.edge_index is not None and data.edge_index.shape[1] > 0:
             edge_index = data.edge_index
             edge_attr = data.edge_attr if hasattr(data, 'edge_attr') and data.edge_attr is not None else None
             
-            # Track edges we've already added (canonical form)
             added_edges = set()
             
             for edge_idx in range(edge_index.shape[1]):
@@ -261,57 +228,39 @@ class TokenizedZINCDataset(Dataset):
                     continue
                 added_edges.add(canonical_edge)
                 
-                # Get node ID tokens
                 u_token = self.token2idx.get(f"node_{u}", self.token2idx["<unk>"])
                 v_token = self.token2idx.get(f"node_{v}", self.token2idx["<unk>"])
                 
-                # Get bond type
                 if edge_attr is not None:
                     bond_type = edge_attr[edge_idx].item()
                     bond_token = self.token2idx.get(f"bond_{bond_type}", self.token2idx["<unk>"])
                 else:
                     bond_token = self.token2idx.get("bond_1", self.token2idx["<unk>"])
-                
-                # Add: u bond v <e>
                 tokens.extend([u_token, bond_token, v_token, self.token2idx["<e>"]])
         
-        # Add node marker and node features
-        # Format: <n> u atom_u v atom_v ...
         tokens.append(self.token2idx["<n>"])
         
         if hasattr(data, 'x') and data.x is not None:
             for node_id, atom_feat in enumerate(data.x):
-                # Node ID token
                 node_token = self.token2idx.get(f"node_{node_id}", self.token2idx["<unk>"])
                 tokens.append(node_token)
                 
-                # Atom type token - extract from one-hot encoding
-                # ZINC PyG data has shape [num_nodes, 1] with atom ID values (0-13)
-                # But if ZINCGraphDataset wrapper is used, would have shape [num_nodes, 119] one-hot
-                # This code handles both cases correctly:
                 if atom_feat.dim() == 0:
-                    # Scalar atom ID
                     atom_id = int(atom_feat.item())
                 elif atom_feat.dim() == 1 and atom_feat.shape[0] > 1:
-                    # One-hot encoded vector: find the index of the non-zero element
-                    # (e.g., shape [119] where exactly one element is 1.0)
                     nonzero_indices = torch.nonzero(atom_feat)
                     if len(nonzero_indices) > 0:
                         atom_id = int(nonzero_indices.squeeze().item())
                     else:
-                        atom_id = 0  # Fallback for all-zero case (shouldn't happen)
+                        atom_id = 0  # Fallback for all-zero case
                 else:
-                    # Single-element vector: extract the atom ID directly
-                    # (e.g., shape [1] with value 0-13)
+                    # Single-element vector
                     atom_id = int(atom_feat[0].item())
                 
                 atom_token = self.token2idx.get(f"atom_{atom_id}", self.token2idx["<unk>"])
                 tokens.append(atom_token)
         
-        # End token
         tokens.append(self.token2idx["<eos>"])
-        
-        # Truncate and pad
         tokens = tokens[:self.max_seq_len]
         input_ids = torch.tensor(tokens, dtype=torch.long)
         
@@ -323,7 +272,6 @@ class TokenizedZINCDataset(Dataset):
             )
             input_ids = torch.cat([input_ids, padding])
         
-        # Create attention mask
         attention_mask = torch.ones_like(input_ids)
         attention_mask[input_ids == self.token2idx["<pad>"]] = 0
         
@@ -345,7 +293,6 @@ class TokenizedZINCDataset(Dataset):
         Returns:
             Dict with 'input_ids', 'attention_mask', 'label'
         """
-        # Get the data - may be tuple (data, label) from ZINCDataset
         item = self.pyg_dataset[idx]
         if isinstance(item, tuple):
             data, label = item
@@ -355,7 +302,6 @@ class TokenizedZINCDataset(Dataset):
         
         input_ids, attention_mask = self._tokenize_graph(data)
         
-        # Regression target (molecular property)
         if isinstance(label, torch.Tensor):
             label = label.item() if label.dim() == 0 else label[0].item()
         
@@ -433,7 +379,6 @@ class AutoGraphTokenizedZINCDataset(Dataset):
                 rng=seed
             )
             
-            # Sample graphs to determine max nodes
             max_nodes = 0
             sample_size = min(100, len(self.pyg_dataset))
             for i in range(sample_size):
@@ -443,15 +388,11 @@ class AutoGraphTokenizedZINCDataset(Dataset):
             
             self.autograph_tokenizer.set_num_nodes(max_nodes)
             
-            # Build extended vocabulary to include all possible node IDs
-            # AutoGraph uses: 0=sos, 1=reset, 2=ladj, 3=radj, 4=eos, 5=pad, 6+=node_indices
-            idx_offset = 6  # AutoGraph's idx_offset
+            idx_offset = 6
             for node_id in range(max_nodes):
                 token_id = idx_offset + node_id
                 self.token2idx[f"node_{node_id}"] = token_id
-                # Also add raw token IDs for direct mapping
                 if token_id not in self.token2idx.values():
-                    # Create reverse mapping so we can recognize these IDs
                     pass
             
         except Exception as e:
@@ -462,11 +403,9 @@ class AutoGraphTokenizedZINCDataset(Dataset):
         """Convert PyG Data to NetworkX graph."""
         g = nx.Graph()
         
-        # Add nodes
         num_nodes = data.num_nodes if hasattr(data, 'num_nodes') else (data.x.shape[0] if hasattr(data, 'x') else 0)
         g.add_nodes_from(range(num_nodes))
         
-        # Add edges
         if hasattr(data, 'edge_index') and data.edge_index is not None:
             edges = data.edge_index.t().cpu().numpy()
             g.add_edges_from(edges)
@@ -783,7 +722,6 @@ class AutoGraphWithNodeFeaturesZINCDataset(Dataset):
         tokens = self._tokenize_graph_with_features(data)
         input_ids, attention_mask = self._pad_and_mask(tokens)
         
-        # Convert label
         if isinstance(label, torch.Tensor):
             label = label.item() if label.dim() == 0 else label[0].item()
         
@@ -914,7 +852,6 @@ class AutoGraphInterspersedFeaturesZINCDataset(Dataset):
         if not (hasattr(data, 'x') and data.x is not None):
             return torch.tensor(trail_tokens[:self.max_seq_len], dtype=torch.long)
         
-        # Build node_id -> atom_id mapping for this graph
         node_to_atom = {}
         for node_id, atom_feat in enumerate(data.x):
             if atom_feat.dim() == 0:
@@ -926,22 +863,17 @@ class AutoGraphInterspersedFeaturesZINCDataset(Dataset):
                 atom_id = int(atom_feat[0].item())
             node_to_atom[node_id] = atom_id
         
-        # Intersperse atom types after node indices
         output_tokens = []
-        idx_offset = 6  # AutoGraph's node index offset
+        idx_offset = 6
         
         for token in trail_tokens:
             output_tokens.append(token)
-            
-            # Check if this is a node index (>= idx_offset)
             if token >= idx_offset:
                 node_id = token - idx_offset
                 if node_id in node_to_atom:
                     atom_id = node_to_atom[node_id]
                     atom_token = self.token2idx.get(f"atom_{atom_id}", self.token2idx["<unk>"])
                     output_tokens.append(atom_token)
-            
-            # Don't exceed max length
             if len(output_tokens) >= self.max_seq_len:
                 break
         
@@ -1129,16 +1061,11 @@ class AutoGraphInterleavedEdgesZINCDataset(Dataset):
                 data.edge_index[1].tolist(), 
                 data.edge_attr
             ):
-                # Canonical form for undirected graphs
                 edge_key = (min(u, v), max(u, v))
-                
-                # Extract bond type
                 if isinstance(bond_feat, torch.Tensor):
                     bond_id = int(bond_feat.item()) if bond_feat.dim() == 0 else int(bond_feat[0].item())
                 else:
                     bond_id = int(bond_feat)
-                
-                # Store only once per undirected edge
                 if edge_key not in edge_bonds:
                     edge_bonds[edge_key] = bond_id
         except Exception as e:
@@ -1188,20 +1115,12 @@ class AutoGraphInterleavedEdgesZINCDataset(Dataset):
         
         for token in trail_tokens:
             if token >= idx_offset:
-                # This is a node token
                 curr_node = int(token) - idx_offset
-                
-                # Add the node token
                 output_tokens.append(token)
-                
-                # Add atom AFTER node
                 if curr_node in node_to_atom:
                     atom_id = node_to_atom[curr_node]
                     atom_token = self.token2idx.get(f"atom_{atom_id}", self.token2idx["<unk>"])
                     output_tokens.append(atom_token)
-                
-                # Look ahead to see if next token is also a node
-                # If so, add bond between current and next
                 node_idx += 1
                 if node_idx < len(node_sequence):
                     next_node = node_sequence[node_idx]
@@ -1211,11 +1130,8 @@ class AutoGraphInterleavedEdgesZINCDataset(Dataset):
                         bond_token = self.token2idx.get(f"bond_{bond_id}", self.token2idx["<unk>"])
                         output_tokens.append(bond_token)
             else:
-                # Special tokens - just append and reset node tracking
                 output_tokens.append(token)
                 node_idx = 0
-            
-            # Don't exceed max length
             if len(output_tokens) >= self.max_seq_len:
                 break
         
@@ -1308,7 +1224,6 @@ class ZINCGraphDataset(Dataset):
         
         # Convert node features to one-hot encoding
         if hasattr(data, 'x') and data.x is not None:
-            # Node features are [num_nodes, 1] with atomic numbers 0-118
             # Convert to one-hot: [num_nodes, 119]
             atomic_nums = data.x.squeeze(-1).long()  # [num_nodes]
             num_nodes = atomic_nums.shape[0]

@@ -34,14 +34,12 @@ def compute_laplacian_pe(edge_index, num_nodes, k=16):
         # Clamp k to a reasonable value - must be at least 1 and less than num_nodes - 2
         k = min(k, max(1, num_nodes - 2))
         
-        # Build adjacency matrix
         row = edge_index[0].cpu().numpy()
         col = edge_index[1].cpu().numpy()
         data = np.ones(len(row))
         adj = coo_matrix((data, (row, col)), shape=(num_nodes, num_nodes))
-        adj = adj + adj.T  # Make symmetric (undirected)
+        adj = adj + adj.T
         
-        # Compute degree matrix
         degrees = np.array(adj.sum(axis=1)).flatten()
         degrees[degrees == 0] = 1  # Avoid division by zero
         inv_sqrt_deg = np.diag(1.0 / np.sqrt(degrees))
@@ -93,12 +91,10 @@ def build_graphgps(args, device: str):
     batch_size = getattr(args, "batch_size", 32)
     learning_rate = getattr(args, "learning_rate", 1e-3)
     hidden_dim = getattr(args, "hidden_dim", None) or getattr(args, "d_model", 64)
-    # Accept either `num_layers` (mpnn style) or `n_layers` (transformer style).
     n_layers = max(1, getattr(args, "num_layers", None) or getattr(args, "n_layers", 3))
     n_heads = getattr(args, "n_heads", 4)
     dropout = getattr(args, "dropout", 0.1)
     
-    # New PE and normalization options
     use_lap_pe = getattr(args, "use_lap_pe", False)
     lap_pe_dim = getattr(args, "lap_pe_dim", 16)
     norm_type = getattr(args, "norm_type", "batch")  # "batch", "layer", "graph", "instance", "none"

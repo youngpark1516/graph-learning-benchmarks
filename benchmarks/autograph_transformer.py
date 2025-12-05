@@ -36,7 +36,6 @@ class GraphDataset(Dataset):
         self.n_samples_per_file = n_samples_per_file
         self.sampling_seed = sampling_seed
 
-        # Load samples (possibly sampled per-file) then build vocabulary
         self.samples = self._load_samples()
         self.token2idx = {"[PAD]": 0, "[CLS]": 1, "[SEP]": 2}
         self._build_vocabulary()
